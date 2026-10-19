@@ -1,0 +1,34 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="row g-4">
+  <div class="col-lg-4">
+    <div class="card p-4">
+      <h3>Contacts</h3>
+      <ul class="list-group list-group-flush">
+        {% for person in users %}
+        <li class="list-group-item"><a href="{{ url_for('messages', user_id=person.id) }}">{{ person.username }}</a></li>
+        {% endfor %}
+      </ul>
+    </div>
+  </div>
+  <div class="col-lg-8">
+    <div class="card p-4">
+      <h3>{% if contact %}Chat with {{ contact.username }}{% else %}Start a conversation{% endif %}</h3>
+      {% if contact %}
+      <div class="border rounded p-3 mb-3" style="min-height: 250px;">
+        {% for msg in thread %}
+        <div class="mb-2"><strong>{{ msg.username }}</strong>: {{ msg.content }}</div>
+        {% endfor %}
+      </div>
+      <form method="post">
+        <input type="hidden" name="recipient_id" value="{{ contact.id }}" />
+        <textarea class="form-control" name="content" required></textarea>
+        <button class="btn btn-primary mt-3">Send message</button>
+      </form>
+      {% else %}
+      <p class="text-muted">Select a contact to open chat.</p>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,109 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="hero-shell p-4 p-lg-5 animate__animated animate__fadeIn">
+  <div class="row align-items-center g-4">
+    <div class="col-lg-7">
+      <div class="d-flex align-items-center gap-2 mb-3">
+        <span class="badge-pill"><i class="fa-solid fa-sparkles"></i> New: gamified learning loops</span>
+      </div>
+      <h1 class="display-4 fw-bold mb-3">Trade hours. Learn skills. Level up your life.</h1>
+      <p class="lead text-muted mb-4">GotTime? brings mentorship, time credits, streaks, and rewards together in one vibrant experience designed for curious people who love growing.</p>
+      <div class="d-flex flex-wrap gap-3 mb-4">
+        <a class="btn btn-primary btn-lg" href="{{ url_for('register') }}">Start your first swap</a>
+        <a class="btn btn-outline-light btn-lg" href="{{ url_for('login') }}">Explore GotTime?</a>
+      </div>
+      <div class="d-flex flex-wrap gap-2">
+        <span class="stat-pill"><i class="fa-solid fa-users"></i> 4k+ learners</span>
+        <span class="stat-pill"><i class="fa-solid fa-award"></i> badges & streaks</span>
+        <span class="stat-pill"><i class="fa-solid fa-circle-check"></i> safe mentoring</span>
+      </div>
+    </div>
+    <div class="col-lg-5">
+      <div class="hero-orb p-4 text-white d-flex flex-column justify-content-between">
+        <div>
+          <div class="d-flex justify-content-between align-items-center mb-4">
+            <span class="badge-pill bg-white text-dark">Live now</span>
+            <span class="badge-pill bg-white text-dark">+12% this week</span>
+          </div>
+          <h3 class="fw-bold">Your next skill is one hour away.</h3>
+          <p class="mb-4">Teach what you know, earn credits, and unlock new experiences in a platform that rewards momentum.</p>
+        </div>
+        <div class="card text-dark p-3">
+          <div class="d-flex justify-content-between"><strong>Credits balance</strong><span class="text-success">+3 this month</span></div>
+          <div class="progress-track mt-2"><div class="progress-fill" style="width: 72%"></div></div>
+          <div class="small text-muted mt-2">Mentor progress • 72% to your next badge</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row mt-4 g-4">
+  <div class="col-md-4">
+    <div class="card h-100 p-4">
+      <div class="hero-graphic mb-3"><i class="fa-solid fa-clock"></i></div>
+      <h4>Time banking</h4>
+      <p class="text-muted">Teach one hour, earn one credit, and invest it in the skills you want to grow next.</p>
+    </div>
+  </div>
+  <div class="col-md-4">
+    <div class="card h-100 p-4">
+      <div class="hero-graphic mb-3"><i class="fa-solid fa-shield-halved"></i></div>
+      <h4>Trusted journeys</h4>
+      <p class="text-muted">Every session can be safely booked, discussed, and reviewed with built-in moderation and reporting.</p>
+    </div>
+  </div>
+  <div class="col-md-4">
+    <div class="card h-100 p-4">
+      <div class="hero-graphic mb-3"><i class="fa-solid fa-trophy"></i></div>
+      <h4>Gamified momentum</h4>
+      <p class="text-muted">Badges, streaks, leaderboards, and milestone rewards make progress feel exciting and visible.</p>
+    </div>
+  </div>
+</div>
+
+<div class="row mt-4 g-4">
+  <div class="col-lg-6">
+    <div class="card p-4">
+      <h3 class="mb-3">How it works</h3>
+      <div class="d-flex gap-3 mb-3">
+        <div class="badge-pill"><i class="fa-solid fa-1"></i></div>
+        <div><strong>Create your profile</strong><br /><span class="text-muted">Show your strengths, location, and availability.</span></div>
+      </div>
+      <div class="d-flex gap-3 mb-3">
+        <div class="badge-pill"><i class="fa-solid fa-2"></i></div>
+        <div><strong>Book a session</strong><br /><span class="text-muted">Find mentors by skill and send a request with ease.</span></div>
+      </div>
+      <div class="d-flex gap-3">
+        <div class="badge-pill"><i class="fa-solid fa-3"></i></div>
+        <div><strong>Earn and spend credits</strong><br /><span class="text-muted">Teach, learn, and unlock achievements as your network grows.</span></div>
+      </div>
+    </div>
+  </div>
+  <div class="col-lg-6">
+    <div class="card p-4">
+      <h3 class="mb-3">Why people love it</h3>
+      <div class="d-flex gap-2 flex-wrap mb-3">
+        <span class="badge-pill">Live mentoring</span>
+        <span class="badge-pill">Instant feedback</span>
+        <span class="badge-pill">Rewarding progress</span>
+      </div>
+      <p class="text-muted">“It feels like a social network, a skill marketplace, and a game all in one place.”</p>
+      <div class="d-flex align-items-center gap-3 mt-4">
+        <div class="hero-graphic"><i class="fa-solid fa-fire"></i></div>
+        <div>
+          <strong>Momentum matters</strong><br />
+          <span class="text-muted">Keep the streak alive and climb the leaderboards.</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="mt-4">
+  <div class="d-flex align-items-center gap-2 mb-3">
+    <span class="badge-pill"><i class="fa-solid fa-microchip"></i> React-powered experience</span>
+  </div>
+  <div id="reactStack"></div>
+</div>
+{% endblock %}

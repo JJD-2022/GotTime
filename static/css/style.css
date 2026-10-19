@@ -1,0 +1,200 @@
+:root {
+  --bg: #060b16;
+  --bg-2: #0f1b31;
+  --surface: rgba(17, 29, 49, 0.86);
+  --surface-2: rgba(26, 43, 68, 0.92);
+  --text: #f7fbff;
+  --muted: #96abca;
+  --accent: #6ee7f9;
+  --accent-2: #ff7eb3;
+  --accent-3: #ffd76b;
+  --success: #4bd8b7;
+  --border: rgba(255, 255, 255, 0.14);
+  --shadow: 0 20px 45px rgba(2, 8, 24, 0.35);
+}
+
+body[data-theme="light"] {
+  --bg: #f4f8ff;
+  --bg-2: #e7f1ff;
+  --surface: rgba(255, 255, 255, 0.9);
+  --surface-2: rgba(240, 247, 255, 0.95);
+  --text: #13253b;
+  --muted: #61758d;
+  --accent: #167dff;
+  --accent-2: #e24687;
+  --accent-3: #ffb020;
+  --success: #0ea77a;
+  --border: rgba(0, 0, 0, 0.08);
+  --shadow: 0 20px 45px rgba(14, 42, 77, 0.12);
+}
+
+body {
+  font-family: "Inter", "Segoe UI", sans-serif;
+  background: radial-gradient(circle at top left, rgba(110, 231, 249, 0.2), transparent 30%), radial-gradient(circle at top right, rgba(255, 126, 179, 0.2), transparent 35%), linear-gradient(135deg, var(--bg), var(--bg-2));
+  color: var(--text);
+  min-height: 100vh;
+  transition: background 0.25s ease, color 0.25s ease;
+}
+
+::selection {
+  background: rgba(110, 231, 249, 0.35);
+}
+
+.navbar, .card, .dashboard-card, .list-group-item, .table, .form-control, .form-select, .btn {
+  border-color: var(--border) !important;
+}
+
+.navbar {
+  background: rgba(4, 10, 24, 0.72);
+  backdrop-filter: blur(18px);
+  border-bottom: 1px solid var(--border);
+}
+
+body[data-theme="light"] .navbar {
+  background: rgba(255, 255, 255, 0.8);
+}
+
+.card, .dashboard-card, .list-group-item, .table {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+}
+
+.hero-shell {
+  background: linear-gradient(135deg, rgba(110, 231, 249, 0.16), rgba(255, 126, 179, 0.2));
+  border: 1px solid var(--border);
+  border-radius: 1.6rem;
+  box-shadow: var(--shadow);
+}
+
+.hero-orb {
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  border-radius: 2rem;
+  min-height: 280px;
+  position: relative;
+  overflow: hidden;
+}
+
+.hero-orb::before,
+.hero-orb::after {
+  content: "";
+  position: absolute;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.2);
+  animation: floaty 5s ease-in-out infinite;
+}
+
+.hero-orb::before {
+  width: 140px;
+  height: 140px;
+  top: 20px;
+  right: 30px;
+}
+
+.hero-orb::after {
+  width: 90px;
+  height: 90px;
+  bottom: 24px;
+  left: 30px;
+  animation-delay: 1.5s;
+}
+
+@keyframes floaty {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-10px); }
+}
+
+.btn-primary {
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  border: none;
+  box-shadow: 0 10px 24px rgba(110, 231, 249, 0.25);
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.btn-primary:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 14px 28px rgba(255, 126, 179, 0.22);
+}
+
+.btn-outline-light {
+  color: var(--text);
+  border-color: var(--border);
+}
+
+.badge-pill {
+  border-radius: 999px;
+  padding: 0.45rem 0.8rem;
+  font-weight: 600;
+  background: rgba(110, 231, 249, 0.16);
+  color: var(--accent);
+}
+
+.stat-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.7rem;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.progress-track {
+  height: 10px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+}
+
+.dashboard-card {
+  border-radius: 1.2rem;
+  padding: 1rem 1.1rem;
+}
+
+.logo-mark {
+  font-size: 1.4rem;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+}
+
+.hero-graphic {
+  font-size: 3rem;
+}
+
+.footer {
+  color: var(--muted);
+}
+
+.form-control, .form-select {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+}
+
+.form-control::placeholder {
+  color: var(--muted);
+}
+
+.table th {
+  color: var(--muted);
+}
+
+.list-group-item {
+  background: transparent;
+  border-color: var(--border);
+}
+
+.profile-photo,
+.avatar img,
+img.rounded-circle {
+  aspect-ratio: 1 / 1;
+  object-fit: cover;
+  object-position: center;
+}

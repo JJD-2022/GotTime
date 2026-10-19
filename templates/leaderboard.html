@@ -1,0 +1,29 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="row g-4">
+  <div class="col-md-4">
+    <div class="card p-4">
+      <h3>Top mentors</h3>
+      <ul class="list-group list-group-flush">
+        {% for item in mentor_leaders %}<li class="list-group-item">{{ item.username }} — {{ item.sessions_completed }} sessions</li>{% endfor %}
+      </ul>
+    </div>
+  </div>
+  <div class="col-md-4">
+    <div class="card p-4">
+      <h3>Most active learners</h3>
+      <ul class="list-group list-group-flush">
+        {% for item in learner_leaders %}<li class="list-group-item">{{ item.username }} — {{ item.sessions_completed }} sessions</li>{% endfor %}
+      </ul>
+    </div>
+  </div>
+  <div class="col-md-4">
+    <div class="card p-4">
+      <h3>Credits earned</h3>
+      <ul class="list-group list-group-flush">
+        {% for item in credit_leaders %}<li class="list-group-item">{{ item.username }} — {{ item.balance }} credits</li>{% endfor %}
+      </ul>
+    </div>
+  </div>
+</div>
+{% endblock %}

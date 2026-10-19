@@ -1,0 +1,37 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="row g-4">
+  <div class="col-lg-5">
+    <div class="card p-4">
+      <h3>Add a skill</h3>
+      <form method="post">
+        <div class="mb-3"><label>Skill name</label><input class="form-control" name="skill_name" required /></div>
+        <div class="mb-3"><label>Category</label><input class="form-control" name="category" /></div>
+        <div class="mb-3"><label>Session duration (minutes)</label><input class="form-control" type="number" name="duration" value="60" /></div>
+        <div class="mb-3"><label>Availability</label><select class="form-select" name="availability"><option value="online">Online</option><option value="offline">Offline</option><option value="both">Both</option></select></div>
+        <button class="btn btn-primary">Save skill</button>
+      </form>
+    </div>
+  </div>
+  <div class="col-lg-7">
+    <div class="card p-4">
+      <h3>Your skill list</h3>
+      <ul class="list-group list-group-flush">
+        {% for skill in user_skills %}
+        <li class="list-group-item d-flex justify-content-between align-items-center">
+          <div>
+            <strong>{{ skill.skill_name }}</strong><br />
+            <small>{{ skill.category }} • {{ skill.duration }} min • {{ skill.availability }}</small>
+          </div>
+          <form method="post" action="{{ url_for('delete_skill', skill_id=skill.skill_id) }}">
+            <button class="btn btn-sm btn-outline-danger">Remove</button>
+          </form>
+        </li>
+        {% else %}
+        <li class="list-group-item text-muted">No skills added yet.</li>
+        {% endfor %}
+      </ul>
+    </div>
+  </div>
+</div>
+{% endblock %}

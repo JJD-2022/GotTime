@@ -1,0 +1,31 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="row g-4">
+  <div class="col-lg-4">
+    <div class="card p-4 text-center">
+      <img src="{{ url_for('static', filename='uploads/' + user.profile_photo) if user.profile_photo else url_for('static', filename='uploads/default.png') }}" class="profile-photo rounded-circle mb-3" width="120" height="120" alt="Profile" />
+      <h3>{{ user.username }}</h3>
+      <p class="text-muted">{{ user.bio or 'Add a bio to tell others about your interests.' }}</p>
+      <div class="d-flex justify-content-center gap-2 flex-wrap">
+        <span class="badge-pill bg-info text-dark">{{ user.role|title }}</span>
+        <span class="badge-pill bg-secondary">{{ user.location or 'Remote' }}</span>
+      </div>
+    </div>
+  </div>
+  <div class="col-lg-8">
+    <div class="card p-4">
+      <h3>Edit profile</h3>
+      <form method="post" enctype="multipart/form-data">
+        <div class="row g-3">
+          <div class="col-md-6"><label>Username</label><input class="form-control" name="username" value="{{ user.username }}" required /></div>
+          <div class="col-md-6"><label>Age</label><input class="form-control" type="number" name="age" value="{{ user.age }}" /></div>
+          <div class="col-md-6"><label>Location</label><input class="form-control" name="location" value="{{ user.location or '' }}" /></div>
+          <div class="col-md-6"><label>Profile Photo</label><input class="form-control" type="file" name="profile_photo" /></div>
+          <div class="col-12"><label>Bio</label><textarea class="form-control" name="bio">{{ user.bio or '' }}</textarea></div>
+        </div>
+        <button class="btn btn-primary mt-3">Save profile</button>
+      </form>
+    </div>
+  </div>
+</div>
+{% endblock %}

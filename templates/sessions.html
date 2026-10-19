@@ -1,0 +1,54 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="row g-4">
+  <div class="col-lg-5">
+    <div class="card p-4">
+      <h3>Book a session</h3>
+      <form method="post">
+        <div class="mb-3"><label>Mentor</label><select class="form-select" name="mentor_id">
+          {% for mentor in mentors %}<option value="{{ mentor.id }}">{{ mentor.username }}</option>{% endfor %}</select></div>
+        <div class="mb-3"><label>Skill</label><select class="form-select" name="skill_id">
+          {% for skill in skills %}<option value="{{ skill.id }}">{{ skill.name }}</option>{% endfor %}</select></div>
+        <div class="mb-3"><label>Schedule</label><input class="form-control" type="datetime-local" name="scheduled_for" /></div>
+        <div class="mb-3"><label>Mode</label><select class="form-select" name="mode"><option value="online">Online</option><option value="offline">Offline</option></select></div>
+        <div class="mb-3"><label>Notes</label><textarea class="form-control" name="notes"></textarea></div>
+        <button class="btn btn-primary">Send request</button>
+      </form>
+    </div>
+  </div>
+  <div class="col-lg-7">
+    <div class="card p-4">
+      <h3>Session requests</h3>
+      <div class="table-responsive">
+        <table class="table">
+          <thead><tr><th>Status</th><th>Mentor</th><th>Skill</th><th>Action</th></tr></thead>
+          <tbody>
+            {% for item in sessions %}
+            <tr>
+              <td>{{ item.status }}</td>
+              <td>{{ item.mentor_id }}</td>
+              <td>{{ item.skill_id }}</td>
+              <td>
+                {% if item.mentor_id == user.id and item.status == 'pending' %}
+                  <form class="d-inline" method="post" action="{{ url_for('accept_session', session_id=item.id) }}"><button class="btn btn-sm btn-success">Accept</button></form>
+                  <form class="d-inline" method="post" action="{{ url_for('reject_session', session_id=item.id) }}"><button class="btn btn-sm btn-danger">Reject</button></form>
+                {% endif %}
+                {% if item.mentor_id == user.id and item.status == 'accepted' %}
+                  <form class="d-inline" method="post" action="{{ url_for('schedule_session', session_id=item.id) }}"><button class="btn btn-sm btn-info">Schedule</button></form>
+                {% endif %}
+                {% if item.mentor_id == user.id and item.status == 'scheduled' %}
+                  <form class="d-inline" method="post" action="{{ url_for('mark_complete', session_id=item.id) }}"><button class="btn btn-sm btn-warning">Mark complete</button></form>
+                {% endif %}
+                {% if item.learner_id == user.id and item.status == 'awaiting_confirmation' %}
+                  <form class="d-inline" method="post" action="{{ url_for('confirm_complete', session_id=item.id) }}"><button class="btn btn-sm btn-primary">Confirm</button></form>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
