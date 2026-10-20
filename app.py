@@ -5,6 +5,7 @@ import hmac
 import hashlib
 import base64
 import binascii
+import ssl
 from datetime import datetime, timedelta, timezone
 from time import monotonic
 from functools import wraps
@@ -40,6 +41,8 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev-secret-key")
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
 app.config["MYSQL_HOST"] = os.getenv("MYSQL_HOST", "localhost")
+app.config["MYSQL_PORT"] = int(os.getenv("MYSQL_PORT", "3306"))
+app.config["MYSQL_SSL_CA"] = os.getenv("MYSQL_SSL_CA", "").strip()
 app.config["MYSQL_USER"] = os.getenv("MYSQL_USER", "root")
 app.config["MYSQL_PASSWORD"] = os.getenv("MYSQL_PASSWORD", "")
 app.config["MYSQL_DB"] = os.getenv("MYSQL_DB", "gottime")
@@ -351,8 +354,15 @@ def allowed_image_file(filename: str) -> bool:
 
 def get_db():
     if "db" not in g:
+        # A configured CA enables verified TLS. Invalid/missing certificates must
+        # fail rather than silently falling back to an unencrypted connection.
+        tls = None
+        if app.config["MYSQL_SSL_CA"]:
+            tls = ssl.create_default_context(cafile=app.config["MYSQL_SSL_CA"])
         g.db = pymysql.connect(
             host=app.config["MYSQL_HOST"],
+            port=app.config["MYSQL_PORT"],
+            ssl=tls,
             user=app.config["MYSQL_USER"],
             password=app.config["MYSQL_PASSWORD"],
             database=app.config["MYSQL_DB"],

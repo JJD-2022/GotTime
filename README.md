@@ -94,3 +94,32 @@ python tests/load_probe.py --users 50 --requests 500
 ```
 
 See [the verification report](docs/verification-2026-10-18.md) for results and remaining service limitations.
+
+## Render with hosted MySQL
+
+Use a Python web service with the repository root as its working directory.
+
+- Build command: `pip install -r requirements.txt && npm --prefix frontend ci --include=dev && npm --prefix frontend run build`
+- Start command: `python serve.py`
+- Set `HOST=0.0.0.0`; Render provides `PORT` automatically.
+- Set a private, generated `SECRET_KEY` and keep it stable between deployments.
+- Set `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_USER`, `MYSQL_PASSWORD`, and `MYSQL_DB`
+  from your database provider. Do not use your laptop's localhost credentials.
+- Add the provider's CA certificate as a Render Secret File named `ca.pem`, and set
+  `MYSQL_SSL_CA=/etc/secrets/ca.pem`. Connections then verify both the certificate
+  and hostname. An invalid or missing configured certificate fails closed.
+- Keep `MYSQL_TIME_ZONE=+05:30`. Without a custom port or CA, local development
+  continues to use port 3306 and the existing local connection behavior.
+
+Initialize a new hosted database with `python manage.py init` before serving requests.
+For an initial single-instance deployment without a separate migration runner, temporarily
+use `python manage.py init && python serve.py` as the start command. Once initialization
+succeeds, return to `python serve.py`. This creates schema and badge definitions;
+it does not copy local accounts or history. Do not run parallel schema initializations.
+
+Keep Google OAuth credentials in Render's environment and register the exact HTTPS
+callback URL in Google Cloud. Database connectivity is required to complete login.
+Never commit passwords, private environment files, or database backups.
+
+Connection configuration tests (no database required):
+`python -m unittest discover -s tests -p test_db_connection.py -v`
