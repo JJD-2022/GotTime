@@ -271,7 +271,7 @@ class Flows(unittest.TestCase):
         return self.request(uid or self.learner, '/api/quests/daily-curiosity',
                             {'quest_key': quest['key'], 'quest_date': quest['date'], **extra})
 
-    def test_daily_quest_xp_only_and_retries_award_once(self):
+    def test_daily_quest_weighted_xp_and_first_badge_awarded_once(self):
         quest = self.quest('mentor_spotlight')
         with patch.object(backend, 'current_daily_quest', return_value=quest):
             with ThreadPoolExecutor(max_workers=6) as pool:
@@ -281,12 +281,12 @@ class Flows(unittest.TestCase):
             data = self.request(self.learner, '/api/app', method='GET').json
             self.assertTrue(data['dailyQuestClaimed'])
             self.assertEqual(data['dailyQuestProgress'], 1)
-            self.assertEqual(data['user']['xp'], 50)
-            self.assertEqual(data['user']['badge_xp'], 0)
-            self.assertEqual(data['badges'], [])
+            self.assertEqual(data['user']['xp'], 10)
+            self.assertEqual([b['name'] for b in data['badges']], ['First Daily Quest'])
+            self.assertEqual([b for r in responses for b in r.json.get('unlockedBadges', [])], ['First Daily Quest'])
         with backend.app.test_request_context():
-            backend.award_badges(self.learner)  # Future activity must not turn bonus XP into a badge.
-        self.assertEqual(self.sql('SELECT COUNT(*) n FROM user_badges WHERE user_id=%s', (self.learner,))[0]['n'], 0)
+            backend.reconcile_progress_badges(self.learner)
+        self.assertEqual(self.sql('SELECT COUNT(*) n FROM user_badges WHERE user_id=%s', (self.learner,))[0]['n'], 1)
         self.assertEqual(self.sql('SELECT balance FROM credits WHERE user_id=%s', (self.learner,))[0]['balance'], 10)
 
     def test_daily_quest_rejects_stale_or_invalid_claims(self):
@@ -354,7 +354,59 @@ class Flows(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     self.claim_quest(quest, mentor_ids=[self.mentor])
             self.assertTrue(self.claim_quest(quest, mentor_ids=[self.mentor]).json['awarded'])
-        self.assertEqual(self.sql('SELECT xp FROM users WHERE id=%s', (self.learner,))[0]['xp'], 50)
+        self.assertEqual(self.sql('SELECT xp FROM users WHERE id=%s', (self.learner,))[0]['xp'], 10)
+
+    def test_quest_xp_unlocks_every_reached_milestone(self):
+        quest = self.quest('mentor_spotlight')
+        for before, expected in ((39, []), (40, ['Curiosity Spark']),
+                                 (240, ['Curiosity Spark', 'Knowledge Seeker']),
+                                 (490, ['Curiosity Spark', 'Knowledge Seeker', 'Time Legend']),
+                                 (495, ['Curiosity Spark', 'Knowledge Seeker', 'Time Legend'])):
+            uid = self.user()
+            self.sql('UPDATE users SET xp=%s WHERE id=%s', (before, uid))
+            with patch.object(backend, 'current_daily_quest', return_value=quest):
+                result = self.claim_quest(quest, uid=uid, mentor_ids=[self.mentor])
+                self.assertEqual(result.status_code, 200)
+                self.assertEqual(result.json['xp'], before + 10)
+                self.assertCountEqual(result.json['unlockedBadges'], expected + ['First Daily Quest'])
+                self.assertFalse(self.claim_quest(quest, uid=uid, mentor_ids=[self.mentor]).json['awarded'])
+
+    def test_first_quest_badge_does_not_repeat_on_later_days(self):
+        quest = self.quest('mentor_spotlight')
+        with patch.object(backend, 'current_daily_quest', return_value=quest):
+            self.assertEqual(self.claim_quest(quest, mentor_ids=[self.mentor]).json['unlockedBadges'], ['First Daily Quest'])
+            tomorrow = backend.today_ist() + timedelta(days=1)
+            quest = {**quest, 'date': tomorrow.isoformat()}
+        with patch.object(backend, 'current_daily_quest', return_value=quest):
+            second = self.claim_quest(quest, mentor_ids=[self.mentor])
+            self.assertEqual(second.json['xp'], 20)
+            self.assertEqual(second.json['unlockedBadges'], [])
+        self.assertEqual(self.sql("SELECT COUNT(*) n FROM notifications WHERE user_id=%s AND type='badge'", (self.learner,))[0]['n'], 1)
+
+    def test_existing_quest_xp_is_reconciled_without_repaying_or_repeating_badges(self):
+        self.sql('UPDATE users SET xp=500 WHERE id=%s', (self.learner,))
+        self.sql("INSERT INTO xp_events(user_id,event_key,amount,event_date) VALUES (%s,'daily_quest_old',500,%s)",
+                 (self.learner, backend.today_ist()-timedelta(days=1)))
+        expected = ['Curiosity Spark', 'Knowledge Seeker', 'Time Legend', 'First Daily Quest']
+        for _ in range(2):
+            data = self.request(self.learner, '/api/app', method='GET').json
+            self.assertEqual(data['user']['xp'], 500)
+            self.assertCountEqual([b['name'] for b in data['badges']], expected)
+        self.assertEqual(self.sql("SELECT COUNT(*) n FROM notifications WHERE user_id=%s AND type='badge'", (self.learner,))[0]['n'], 4)
+
+    def test_new_badge_catalog_entry_created_once_on_existing_deployment(self):
+        # Simulate an existing deployment that does not run init when it starts.
+        self.sql("DELETE ub FROM user_badges ub JOIN badges b ON b.id=ub.badge_id WHERE b.name='First Daily Quest'")
+        self.sql("DELETE FROM badges WHERE name='First Daily Quest'")
+        users = [self.user() for _ in range(4)]
+        quest = self.quest('mentor_spotlight')
+        with patch.object(backend, 'current_daily_quest', return_value=quest):
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                responses = list(pool.map(lambda uid: self.claim_quest(quest, uid=uid, mentor_ids=[self.mentor]), users))
+        self.assertEqual([r.status_code for r in responses], [200] * 4)
+        self.assertEqual(self.sql("SELECT COUNT(*) n FROM badges WHERE name='First Daily Quest'")[0]['n'], 1)
+        for r in responses:
+            self.assertEqual(r.json['unlockedBadges'], ['First Daily Quest'])
 
     def test_non_quest_xp_still_unlocks_normal_badges(self):
         with backend.app.test_request_context():

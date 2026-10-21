@@ -26,7 +26,10 @@ class DailyQuestRotation(unittest.TestCase):
                          {'mentor_views', 'book_sessions', 'complete_sessions'})
         for kind in ('book_sessions', 'complete_sessions'):
             self.assertEqual({q['target'] for q in backend.DAILY_QUESTS if q['kind'] == kind}, {1, 2})
-        self.assertTrue(all(q['xp'] == 50 for q in backend.DAILY_QUESTS))
+        self.assertEqual({q['key']: q['xp'] for q in backend.DAILY_QUESTS}, {
+            'mentor_spotlight': 10, 'mentor_explorer': 20, 'book_one': 25,
+            'book_two': 40, 'complete_one': 50, 'complete_two': 100,
+        })
         self.assertTrue(all('date' not in q for q in backend.DAILY_QUESTS))
 
 

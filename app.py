@@ -318,7 +318,6 @@ def minimal_app_payload(error: str = ""):
         app.logger.exception("Minimal app payload also hit a non-fatal issue: %s", exc)
         raise
     user = current_user()
-    user["badge_xp"] = badge_eligible_xp(user_id, user.get("xp", 0))
     quest_progress = daily_quest["target"] if daily_quest_claimed else daily_quest_progress(user_id, daily_quest)
     payload = {
         "user": user,
@@ -477,9 +476,10 @@ def seed_sample_data():
             ("Conversation Starter", "social", "Started your first skill chat."),
             ("Calendar Captain", "planning", "Scheduled your first session."),
             ("Time Trader", "master", "Completed 10 total sessions."),
-            ("Curiosity Spark", "xp", "Earned 50 XP by exploring mentor profiles."),
+            ("Curiosity Spark", "xp", "Reached 50 total XP on GotTime."),
             ("Knowledge Seeker", "xp", "Reached 250 XP on GotTime."),
             ("Time Legend", "xp", "Reached 500 XP on GotTime."),
+            ("First Daily Quest", "quest", "Completed your first daily quest."),
         )
         for name, category, description in default_badges:
             cursor.execute("SELECT id FROM badges WHERE name = %s", (name,))
@@ -1102,7 +1102,7 @@ DAILY_QUESTS = (
         "description": "Check out 1 mentor profile today.",
         "target": 1,
         "kind": "mentor_views",
-        "xp": 50,
+        "xp": 10,
     },
     {
         "key": "book_one",
@@ -1110,7 +1110,7 @@ DAILY_QUESTS = (
         "description": "Book 1 session today. The session itself can be on a later date.",
         "target": 1,
         "kind": "book_sessions",
-        "xp": 50,
+        "xp": 25,
     },
     {
         "key": "complete_one",
@@ -1126,7 +1126,7 @@ DAILY_QUESTS = (
         "description": "Explore 2 different mentor profiles today.",
         "target": 2,
         "kind": "mentor_views",
-        "xp": 50,
+        "xp": 20,
     },
     {
         "key": "book_two",
@@ -1134,7 +1134,7 @@ DAILY_QUESTS = (
         "description": "Book 2 different sessions today. They can take place on later dates.",
         "target": 2,
         "kind": "book_sessions",
-        "xp": 50,
+        "xp": 40,
     },
     {
         "key": "complete_two",
@@ -1142,7 +1142,7 @@ DAILY_QUESTS = (
         "description": "Complete 2 sessions today as a learner or mentor. Both sides must confirm each one.",
         "target": 2,
         "kind": "complete_sessions",
-        "xp": 50,
+        "xp": 100,
     },
 )
 
@@ -1215,13 +1215,55 @@ def has_daily_quest_claim(user_id, quest):
         return cursor.fetchone()["count"] > 0
 
 
-def badge_eligible_xp(user_id, total_xp):
+def award_progress_badges(user_id):
+    """Award total-XP milestones and the one-time quest badge under the user lock.
+
+    Call inside a transaction. Old quest XP counts too; never rewrite the ledger.
+    """
+    unlocked = []
     with get_db().cursor() as cursor:
+        cursor.execute("SELECT COALESCE(xp, 0) AS xp FROM users WHERE id = %s FOR UPDATE", (user_id,))
+        user = cursor.fetchone()
+        if not user:
+            return unlocked
         cursor.execute(
-            """SELECT COALESCE(SUM(amount), 0) AS bonus FROM xp_events
-               WHERE user_id = %s AND LEFT(event_key, 11) = 'daily_quest'""", (user_id,),
+            """SELECT EXISTS(SELECT 1 FROM xp_events
+               WHERE user_id = %s AND LEFT(event_key, 11) = 'daily_quest') AS completed""", (user_id,),
         )
-        return max(0, int(total_xp) - int(cursor.fetchone()["bonus"]))
+        completed_quest = bool(cursor.fetchone()["completed"])
+        earned_names = [name for threshold, name in ((50, "Curiosity Spark"), (250, "Knowledge Seeker"), (500, "Time Legend"))
+                       if user["xp"] >= threshold]
+        if completed_quest:
+            earned_names.append("First Daily Quest")
+            cursor.execute("SELECT id FROM badges WHERE name = 'First Daily Quest'")
+            if not cursor.fetchone():
+                # Existing deployments skip startup seeding. Serialize the one-time
+                # catalog addition on an existing badge row, then recheck after locking.
+                cursor.execute("SELECT id FROM badges ORDER BY id LIMIT 1 FOR UPDATE")
+                cursor.fetchone()
+                cursor.execute("SELECT id FROM badges WHERE name = 'First Daily Quest'")
+                if not cursor.fetchone():
+                    cursor.execute("INSERT INTO badges (name, category, description) VALUES ('First Daily Quest', 'quest', 'Completed your first daily quest.')")
+        if not earned_names:
+            return unlocked
+        cursor.execute("SELECT id, name FROM badges")
+        lookup = {row["name"]: row["id"] for row in cursor.fetchall()}
+        cursor.execute("SELECT badge_id FROM user_badges WHERE user_id = %s", (user_id,))
+        existing = {row["badge_id"] for row in cursor.fetchall()}
+        for name in earned_names:
+            badge_id = lookup.get(name)
+            if badge_id and badge_id not in existing:
+                cursor.execute("INSERT INTO user_badges (user_id, badge_id) VALUES (%s, %s)", (user_id, badge_id))
+                existing.add(badge_id)
+                unlocked.append(name)
+                create_notification(user_id, "badge", f"You unlocked the {name} badge.")
+    return unlocked
+
+
+@atomic
+def reconcile_progress_badges(user_id):
+    # Also repair milestones withheld by the previous quest-XP exclusion.
+    return award_progress_badges(user_id)
 
 
 def award_badges(user_id: int):
@@ -1250,11 +1292,6 @@ def award_badges(user_id: int):
         credit_row = cursor.fetchone()
         balance = credit_row["balance"] if credit_row else 0
 
-        cursor.execute("SELECT COALESCE(xp, 0) AS xp, COALESCE(streak, 0) AS streak FROM users WHERE id = %s", (user_id,))
-        xp_row = cursor.fetchone()
-        xp = badge_eligible_xp(user_id, xp_row["xp"] if xp_row else 0)
-        streak = xp_row["streak"] if xp_row else 0
-
         cursor.execute("SELECT id, name FROM badges")
         badge_lookup = {row["name"]: row["id"] for row in cursor.fetchall()}
         cursor.execute("SELECT badge_id FROM user_badges WHERE user_id = %s", (user_id,))
@@ -1281,14 +1318,7 @@ def award_badges(user_id: int):
                 existing_ids.add(badge_id)
                 unlocked.append(badge_name)
                 create_notification(user_id, "badge", f"You unlocked the {badge_name} badge.")
-        xp_milestones = ((50, "Curiosity Spark"), (250, "Knowledge Seeker"), (500, "Time Legend"))
-        for threshold, badge_name in xp_milestones:
-            badge_id = badge_lookup.get(badge_name)
-            if badge_id and xp >= threshold and badge_id not in existing_ids:
-                cursor.execute("INSERT INTO user_badges (user_id, badge_id) VALUES (%s, %s)", (user_id, badge_id))
-                existing_ids.add(badge_id)
-                unlocked.append(badge_name)
-                create_notification(user_id, "badge", f"You unlocked the {badge_name} badge.")
+    unlocked.extend(award_progress_badges(user_id))
     return unlocked
 
 
@@ -1325,14 +1355,13 @@ def award_xp(user_id: int, amount: int, event_key: str, message: str, *, event_d
         except pymysql.err.IntegrityError:
             cursor.execute("SELECT COALESCE(xp, 0) AS xp FROM users WHERE id = %s", (user_id,))
             row = cursor.fetchone()
-            return {"awarded": False, "xp": row["xp"] if row else 0}
+            return {"awarded": False, "xp": row["xp"] if row else 0, "unlockedBadges": []}
         cursor.execute("UPDATE users SET xp = COALESCE(xp, 0) + %s WHERE id = %s", (amount, user_id))
         cursor.execute("SELECT COALESCE(xp, 0) AS xp FROM users WHERE id = %s", (user_id,))
         xp = cursor.fetchone()["xp"]
     create_notification(user_id, "xp", message)
-    if not event_key.startswith("daily_quest"):
-        award_badges(user_id)
-    return {"awarded": True, "xp": xp}
+    unlocked = award_progress_badges(user_id) if event_key.startswith("daily_quest") else award_badges(user_id)
+    return {"awarded": True, "xp": xp, "unlockedBadges": unlocked}
 
 
 def password_matches(stored_password: str | None, candidate: str) -> bool:
@@ -2244,6 +2273,7 @@ def api_app_data():
     if signed_in and signed_in.get("needs_birthdate"):
         return jsonify({"error": "Birthdate verification is required.", "needs_birthdate": True}), 428
     try:
+        reconcile_progress_badges(session["user_id"])
         return jsonify(minimal_app_payload())
     except Exception:
         app.logger.exception("App data failed")
