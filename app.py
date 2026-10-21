@@ -14,6 +14,7 @@ from urllib.parse import urlencode
 
 import pymysql
 import requests
+from payment_security import valid_signature, valid_payment_id, payment_problem
 import urllib3
 from flask import Flask, flash, g, jsonify, redirect, render_template, request, send_from_directory, session, url_for
 from flask_mail import Mail, Message
@@ -59,6 +60,7 @@ app.config["MAIL_DEFAULT_SENDER"] = os.getenv("MAIL_DEFAULT_SENDER", "gottime@ex
 app.config["GOOGLE_OAUTH_VERIFY_SSL"] = os.getenv("GOOGLE_OAUTH_VERIFY_SSL", "true").lower() not in {"0", "false", "no"}
 app.config["RAZORPAY_KEY_ID"] = os.getenv("RAZORPAY_KEY_ID", "")
 app.config["RAZORPAY_KEY_SECRET"] = os.getenv("RAZORPAY_KEY_SECRET", "")
+app.config["RAZORPAY_WEBHOOK_SECRET"] = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
 app.config["DONATION_UPI_ID"] = os.getenv("DONATION_UPI_ID", "")
 app.config["DONATION_UPI_NAME"] = os.getenv("DONATION_UPI_NAME", "GotTime")
 
@@ -2389,19 +2391,193 @@ def api_reset_daily_quest():
     return jsonify({"error": "Daily quests reset automatically at midnight IST."}), 403
 
 
+class PaymentVerificationError(Exception):
+    def __init__(self, message, status=409):
+        super().__init__(message)
+        self.status = status
+
+
+@app.errorhandler(PaymentVerificationError)
+def payment_verification_error(error):
+    return jsonify({"error": str(error)}), error.status
+
+
+def payment_keys(*, require_webhook=False):
+    key_id = app.config["RAZORPAY_KEY_ID"]
+    key_secret = app.config["RAZORPAY_KEY_SECRET"]
+    if not key_id or not key_secret:
+        raise PaymentVerificationError("Payments are not configured.", 503)
+    if require_webhook and key_id.startswith("rzp_live_") and not app.config["RAZORPAY_WEBHOOK_SECRET"]:
+        raise PaymentVerificationError("Live payments are awaiting webhook configuration.", 503)
+    return key_id, key_secret
+
+
+def fetch_razorpay_payment(payment_id):
+    if not valid_payment_id(payment_id):
+        raise PaymentVerificationError("Invalid payment ID.", 400)
+    keys = payment_keys()
+    try:
+        response = requests.get(
+            f"https://api.razorpay.com/v1/payments/{payment_id}",
+            auth=keys, timeout=(2, 2),
+        )
+        response.raise_for_status()
+        payment = response.json()
+    except (requests.RequestException, ValueError):
+        app.logger.warning("Razorpay payment lookup unavailable")
+        raise PaymentVerificationError(
+            "Payment confirmation is temporarily unavailable. Do not pay again; check your wallet shortly.", 503
+        ) from None
+    if not isinstance(payment, dict) or payment.get("id") != payment_id:
+        raise PaymentVerificationError("Unexpected payment response from provider.", 502)
+    return payment
+
+
+PAYMENT_TABLES = ("credit_payments", "donation_payments")
+
+
+def find_payment_order(table, order_id, owner_id=None):
+    if table not in PAYMENT_TABLES:
+        raise ValueError("Invalid payment table")
+    with get_db().cursor() as cursor:
+        cursor.execute(f"SELECT * FROM {table} WHERE provider_order_id = %s", (order_id,))
+        order = cursor.fetchone()
+    if order and (owner_id is None or order["user_id"] == owner_id):
+        return order
+    return None
+
+
+@atomic
+def finalize_razorpay_payment(table, payment, owner_id=None):
+    """Both delivery paths serialize on the same persisted order before granting anything."""
+    if table not in PAYMENT_TABLES:
+        raise ValueError("Invalid payment table")
+    with get_db().cursor() as cursor:
+        cursor.execute(
+            f"SELECT * FROM {table} WHERE provider_order_id = %s FOR UPDATE",
+            (payment.get("order_id"),),
+        )
+        order = cursor.fetchone()
+        if not order or (owner_id is not None and order["user_id"] != owner_id):
+            raise PaymentVerificationError("Payment order was not found.", 404)
+        problem = payment_problem(payment, order)
+        if problem:
+            raise PaymentVerificationError(problem)
+        if order["status"] == "paid":
+            if order["provider_payment_id"] != payment["id"]:
+                raise PaymentVerificationError("Order already has a different payment.")
+            return {"paid": True, "message": "Payment already verified."}
+        if order["status"] != "created":
+            raise PaymentVerificationError("This order requires manual payment review.")
+        if payment.get("status") in ("created", "authorized"):
+            return {
+                "paid": False, "pending": True,
+                "message": "Payment is awaiting capture. Do not pay again; check back shortly.",
+            }
+        if (payment.get("status") != "captured" or payment.get("captured") is not True
+                or payment.get("amount_refunded") != 0):
+            raise PaymentVerificationError("Payment is not captured or has been refunded. No credits were added.")
+        cursor.execute(
+            f"UPDATE {table} SET status = 'paid', provider_payment_id = %s, paid_at = NOW() WHERE id = %s",
+            (payment["id"], order["id"]),
+        )
+        user_id = order["user_id"]
+        if table == "credit_payments":
+            cursor.execute(
+                "INSERT INTO credits (user_id, balance) VALUES (%s, 0) ON DUPLICATE KEY UPDATE balance = balance",
+                (user_id,),
+            )
+            cursor.execute("UPDATE credits SET balance = balance + %s WHERE user_id = %s",
+                           (order["credits"], user_id))
+            cursor.execute(
+                "INSERT INTO transactions (user_id, kind, amount, note) VALUES (%s, 'bonus', %s, %s)",
+                (user_id, order["credits"], f"Paid credit pack - ₹{int(order['amount_paise']) // 100}"),
+            )
+            create_notification(user_id, "credit", f"{order['credits']} paid credits added to your wallet.")
+            return {"paid": True, "credits": order["credits"],
+                    "message": f"Payment successful. {order['credits']} credits added."}
+        amount = int(order["amount_paise"]) // 100
+        if user_id is not None:
+            create_notification(user_id, "donation", f"Thank you for donating ₹{amount} to support GotTime.")
+        return {"paid": True, "message": f"Thank you for your ₹{amount} donation."}
+
+
+def verify_checkout_payment(table):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        raise PaymentVerificationError("Payment verification details are missing.", 400)
+    order_id = payload.get("razorpay_order_id")
+    payment_id = payload.get("razorpay_payment_id")
+    if not isinstance(order_id, str) or not order_id or len(order_id) > 120 or not valid_payment_id(payment_id):
+        raise PaymentVerificationError("Invalid payment verification details.", 400)
+    _, secret = payment_keys()
+    order = find_payment_order(table, order_id, session["user_id"])
+    if not order:
+        raise PaymentVerificationError("Payment order was not found.", 404)
+    signed_body = f"{order['provider_order_id']}|{payment_id}".encode("utf-8")
+    if not valid_signature(secret, signed_body, payload.get("razorpay_signature")):
+        raise PaymentVerificationError("Payment signature verification failed.", 400)
+    payment = fetch_razorpay_payment(payment_id)
+    # Never let a valid payment for some other local order fulfill that order through this callback.
+    problem = payment_problem(payment, order)
+    if problem:
+        raise PaymentVerificationError(problem)
+    result = finalize_razorpay_payment(table, payment, session["user_id"])
+    if table == "credit_payments":
+        result["user"] = current_user()
+    return jsonify(result), 200 if result["paid"] else 202
+
+
+@app.post("/api/payments/razorpay/webhook")
+def api_razorpay_webhook():
+    secret = app.config["RAZORPAY_WEBHOOK_SECRET"]
+    if not secret:
+        raise PaymentVerificationError("Webhook is not configured.", 503)
+    if request.content_length is not None and request.content_length > 65536:
+        return jsonify({"error": "Webhook too large."}), 413
+    raw = request.get_data()
+    if len(raw) > 65536:
+        return jsonify({"error": "Webhook too large."}), 413
+    if not valid_signature(secret, raw, request.headers.get("X-Razorpay-Signature")):
+        return jsonify({"error": "Invalid webhook signature."}), 400
+    try:
+        event = json.loads(raw)
+        if not isinstance(event, dict):
+            raise ValueError()
+        if event.get("event") not in ("payment.captured", "order.paid"):
+            return jsonify({"received": True, "ignored": True})
+        entity = event["payload"]["payment"]["entity"]
+        payment_id, order_id = entity["id"], entity["order_id"]
+        if not valid_payment_id(payment_id) or not isinstance(order_id, str) or len(order_id) > 120:
+            raise ValueError()
+    except (ValueError, KeyError, TypeError):
+        return jsonify({"error": "Invalid webhook payload."}), 400
+    table = next((name for name in PAYMENT_TABLES if find_payment_order(name, order_id)), None)
+    if table is None:
+        # The same merchant account can receive orders from other applications.
+        return jsonify({"received": True, "ignored": True})
+    payment = fetch_razorpay_payment(payment_id)
+    if payment.get("order_id") != order_id:
+        raise PaymentVerificationError("Webhook order does not match payment.")
+    result = finalize_razorpay_payment(table, payment)
+    if not result["paid"]:
+        # Non-2xx asks Razorpay to retry; never acknowledge an unfulfilled capture.
+        return jsonify(result), 503
+    return jsonify({"received": True})
+
+
 @app.post("/api/credits/purchase")
 @api_login_required
 def api_purchase_credits():
     packages = credit_packages()
     payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Choose a valid credit package."}), 400
     package_id = str(payload.get("packageId") or "").strip().lower()
     package = packages.get(package_id)
     if not package:
         return jsonify({"error": "Choose a valid credit package."}), 400
-    key_id = app.config["RAZORPAY_KEY_ID"]
-    key_secret = app.config["RAZORPAY_KEY_SECRET"]
-    if not key_id or not key_secret:
-        return jsonify({"error": "Razorpay keys are missing. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET in .env."}), 500
+    key_id, key_secret = payment_keys(require_webhook=True)
     user_id = session["user_id"]
     amount_paise = int(package["price"]) * 100
     receipt = f"gt_{user_id}_{package_id}_{secrets.token_hex(5)}"
@@ -2422,11 +2598,12 @@ def api_purchase_credits():
             timeout=15,
         )
         order = response.json()
-    except Exception as exc:
+    except (requests.RequestException, ValueError):
         app.logger.exception("Razorpay order create failed")
-        return jsonify({"error": f"Could not start payment: {exc}"}), 502
-    if response.status_code >= 400 or not order.get("id"):
-        return jsonify({"error": order.get("error", {}).get("description") or "Razorpay could not create the order."}), 502
+        return jsonify({"error": "Could not start payment. Please try again shortly."}), 502
+    if (response.status_code >= 400 or not isinstance(order, dict) or not order.get("id")
+            or order.get("amount") != amount_paise or order.get("currency") != "INR"):
+        return jsonify({"error": "Razorpay could not create the expected order."}), 502
     ensure_payment_tables()
     with get_db().cursor() as cursor:
         cursor.execute(
@@ -2450,52 +2627,8 @@ def api_purchase_credits():
 
 @app.post("/api/credits/verify")
 @api_login_required
-@atomic
 def api_verify_credit_payment():
-    payload = request.get_json(silent=True) or {}
-    order_id = str(payload.get("razorpay_order_id") or "").strip()
-    payment_id = str(payload.get("razorpay_payment_id") or "").strip()
-    signature = str(payload.get("razorpay_signature") or "").strip()
-    if not order_id or not payment_id or not signature:
-        return jsonify({"error": "Payment verification details are missing."}), 400
-    key_secret = app.config["RAZORPAY_KEY_SECRET"]
-    if not key_secret:
-        return jsonify({"error": "Payments are not configured."}), 503
-    expected = hmac.new(
-        key_secret.encode("utf-8"),
-        f"{order_id}|{payment_id}".encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    if not hmac.compare_digest(expected, signature):
-        return jsonify({"error": "Payment signature verification failed."}), 400
-    user_id = session["user_id"]
-    with get_db().cursor() as cursor:
-        cursor.execute(
-            "SELECT * FROM credit_payments WHERE provider_order_id = %s AND user_id = %s FOR UPDATE",
-            (order_id, user_id),
-        )
-        payment = cursor.fetchone()
-        if not payment:
-            return jsonify({"error": "Payment order was not found."}), 404
-        if payment["status"] == "paid":
-            return jsonify({"message": "Payment already verified.", "credits": payment["credits"], "user": current_user()})
-        cursor.execute(
-            """UPDATE credit_payments
-               SET status = 'paid', provider_payment_id = %s, paid_at = NOW()
-               WHERE id = %s""",
-            (payment_id, payment["id"]),
-        )
-        cursor.execute(
-            "INSERT INTO credits (user_id, balance) VALUES (%s, 0) ON DUPLICATE KEY UPDATE balance = balance",
-            (user_id,),
-        )
-        cursor.execute("UPDATE credits SET balance = balance + %s WHERE user_id = %s", (payment["credits"], user_id))
-        cursor.execute(
-            "INSERT INTO transactions (user_id, kind, amount, note) VALUES (%s, 'bonus', %s, %s)",
-            (user_id, payment["credits"], f"Paid credit pack - ₹{int(payment['amount_paise']) // 100}"),
-        )
-    create_notification(user_id, "credit", f"{payment['credits']} paid credits added to your wallet.")
-    return jsonify({"message": f"Payment successful. {payment['credits']} credits added.", "credits": payment["credits"], "user": current_user()})
+    return verify_checkout_payment("credit_payments")
 
 
 @app.get("/api/donations/upi")
@@ -2511,16 +2644,15 @@ def api_donation_upi():
 @api_login_required
 def api_create_donation():
     payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Enter a valid donation amount."}), 400
     try:
         amount_rupees = int(payload.get("amount") or 0)
     except (TypeError, ValueError):
         amount_rupees = 0
     if amount_rupees < 10:
         return jsonify({"error": "Donation amount must be at least ₹10."}), 400
-    key_id = app.config["RAZORPAY_KEY_ID"]
-    key_secret = app.config["RAZORPAY_KEY_SECRET"]
-    if not key_id or not key_secret:
-        return jsonify({"error": "Razorpay keys are missing. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET in .env."}), 500
+    key_id, key_secret = payment_keys(require_webhook=True)
     user = current_user()
     user_id = session["user_id"]
     amount_paise = amount_rupees * 100
@@ -2541,11 +2673,12 @@ def api_create_donation():
             timeout=15,
         )
         order = response.json()
-    except Exception as exc:
+    except (requests.RequestException, ValueError):
         app.logger.exception("Razorpay donation order create failed")
-        return jsonify({"error": f"Could not start donation: {exc}"}), 502
-    if response.status_code >= 400 or not order.get("id"):
-        return jsonify({"error": order.get("error", {}).get("description") or "Razorpay could not create the donation order."}), 502
+        return jsonify({"error": "Could not start donation. Please try again shortly."}), 502
+    if (response.status_code >= 400 or not isinstance(order, dict) or not order.get("id")
+            or order.get("amount") != amount_paise or order.get("currency") != "INR"):
+        return jsonify({"error": "Razorpay could not create the expected donation order."}), 502
     ensure_payment_tables()
     with get_db().cursor() as cursor:
         cursor.execute(
@@ -2569,45 +2702,8 @@ def api_create_donation():
 
 @app.post("/api/donations/verify")
 @api_login_required
-@atomic
 def api_verify_donation():
-    payload = request.get_json(silent=True) or {}
-    order_id = str(payload.get("razorpay_order_id") or "").strip()
-    payment_id = str(payload.get("razorpay_payment_id") or "").strip()
-    signature = str(payload.get("razorpay_signature") or "").strip()
-    if not order_id or not payment_id or not signature:
-        return jsonify({"error": "Donation verification details are missing."}), 400
-    key_secret = app.config["RAZORPAY_KEY_SECRET"]
-    if not key_secret:
-        return jsonify({"error": "Donations are not configured."}), 503
-    expected = hmac.new(
-        key_secret.encode("utf-8"),
-        f"{order_id}|{payment_id}".encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    if not hmac.compare_digest(expected, signature):
-        return jsonify({"error": "Donation signature verification failed."}), 400
-    user_id = session["user_id"]
-    with get_db().cursor() as cursor:
-        cursor.execute(
-            "SELECT * FROM donation_payments WHERE provider_order_id = %s AND user_id = %s FOR UPDATE",
-            (order_id, user_id),
-        )
-        donation = cursor.fetchone()
-        if not donation:
-            return jsonify({"error": "Donation order was not found."}), 404
-        if donation["status"] == "paid":
-            return jsonify({"message": "Donation already verified."})
-        if donation["status"] != "paid":
-            cursor.execute(
-                """UPDATE donation_payments
-                   SET status = 'paid', provider_payment_id = %s, paid_at = NOW()
-                   WHERE id = %s""",
-                (payment_id, donation["id"]),
-            )
-    amount = int(donation["amount_paise"]) // 100
-    create_notification(user_id, "donation", f"Thank you for donating ₹{amount} to support GotTime.")
-    return jsonify({"message": f"Thank you. Your ₹{amount} donation helps cover servers, database maintenance, and future improvements."})
+    return verify_checkout_payment("donation_payments")
 
 
 @app.post("/api/dev/reset-gamification")

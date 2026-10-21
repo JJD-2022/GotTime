@@ -121,5 +121,10 @@ Keep Google OAuth credentials in Render's environment and register the exact HTT
 callback URL in Google Cloud. Database connectivity is required to complete login.
 Never commit passwords, private environment files, or database backups.
 
+For real payments, follow [Razorpay live setup](docs/razorpay-live-setup.md).
+Live checkouts require `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, and the separate
+`RAZORPAY_WEBHOOK_SECRET`. Configure the dashboard webhook and automatic capture
+before accepting payments. Refund reconciliation remains manual.
+
 Connection configuration tests (no database required):
 `python -m unittest discover -s tests -p test_db_connection.py -v`

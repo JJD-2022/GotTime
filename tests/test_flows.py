@@ -9,7 +9,7 @@ import json
 import base64
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 import pymysql
 import app as backend
 from manage import add_indexes
@@ -251,15 +251,125 @@ class Flows(unittest.TestCase):
         self.assertEqual(self.request(self.learner,f'/api/sessions/{sid}/rating',{'score':5,'feedback':'Helpful'}).status_code,200)
 
     def test_payment_credit_retry_is_idempotent(self):
-        backend.app.config['RAZORPAY_KEY_SECRET']='audit-only-secret'
-        order='audit_'+uuid.uuid4().hex
-        self.sql("INSERT INTO credit_payments(user_id,package_id,credits,amount_paise,provider_order_id,status) VALUES (%s,'starter',5,9900,%s,'created')",(self.learner,order))
-        signature=hmac.new(b'audit-only-secret',f'{order}|test_payment'.encode(),hashlib.sha256).hexdigest()
-        body={'razorpay_order_id':order,'razorpay_payment_id':'test_payment','razorpay_signature':signature}
+        payment, body = self.payment_fixture()
         with ThreadPoolExecutor(max_workers=8) as pool:
-            results=list(pool.map(lambda _: self.request(self.learner,'/api/credits/verify',body).status_code,range(8)))
-        self.assertEqual(results,[200]*8)
+            results=list(pool.map(lambda n: (self.request(self.learner,'/api/credits/verify',body)
+                if n % 2 else self.payment_webhook(payment, 'order.paid' if n % 4 else 'payment.captured')).status_code,range(12)))
+        self.assertEqual(results,[200]*12)
         self.assertEqual(self.sql('SELECT balance FROM credits WHERE user_id=%s',(self.learner,))[0]['balance'],15)
+        self.assertEqual(self.sql('SELECT COUNT(*) n FROM transactions WHERE user_id=%s',(self.learner,))[0]['n'],1)
+        self.assertEqual(self.sql("SELECT COUNT(*) n FROM notifications WHERE user_id=%s AND type='credit'",(self.learner,))[0]['n'],1)
+
+    def payment_fixture(self, donation=False):
+        config = patch.dict(backend.app.config, RAZORPAY_KEY_ID='rzp_test_audit',
+                            RAZORPAY_KEY_SECRET='audit-only-secret', RAZORPAY_WEBHOOK_SECRET='audit-webhook-secret')
+        config.start()
+        self.addCleanup(config.stop)
+        order, pid = 'order_'+uuid.uuid4().hex, 'pay_'+uuid.uuid4().hex
+        if donation:
+            self.sql("INSERT INTO donation_payments(user_id,amount_paise,provider_order_id,status) VALUES (%s,9900,%s,'created')",(self.learner,order))
+        else:
+            self.sql("INSERT INTO credit_payments(user_id,package_id,credits,amount_paise,provider_order_id,status) VALUES (%s,'starter',5,9900,%s,'created')",(self.learner,order))
+        payment = dict(id=pid, order_id=order, amount=9900, currency='INR', status='captured', captured=True, amount_refunded=0)
+        response = Mock()
+        response.json.return_value = payment
+        provider = patch.object(backend.requests, 'get', return_value=response)
+        self.payment_lookup = provider.start()
+        self.addCleanup(provider.stop)
+        body = dict(razorpay_order_id=order, razorpay_payment_id=pid,
+                    razorpay_signature=hmac.new(b'audit-only-secret',f'{order}|{pid}'.encode(),hashlib.sha256).hexdigest())
+        return payment, body
+
+    def payment_webhook(self, payment, event='payment.captured', signature=None):
+        raw = json.dumps(dict(event=event, payload=dict(payment=dict(entity=payment)))).encode()
+        signed = hmac.new(b'audit-webhook-secret',raw,hashlib.sha256).hexdigest()
+        with backend.app.test_client() as client:
+            return client.post('/api/payments/razorpay/webhook', data=raw, content_type='application/json',
+                               headers={'X-Razorpay-Signature':signature if signature is not None else signed})
+
+    def test_payment_rejects_wrong_signature_owner_amount_currency_order(self):
+        payment, body = self.payment_fixture()
+        self.assertEqual(self.request(self.mentor,'/api/credits/verify',body).status_code,404)
+        self.assertEqual(self.request(self.learner,'/api/credits/verify',{**body,'razorpay_signature':'f'*64}).status_code,400)
+        self.assertEqual(self.payment_webhook(payment, signature='f'*64).status_code,400)
+        self.payment_lookup.assert_not_called()
+        for key, value in [('amount',1),('currency','USD'),('order_id','order_wrong'),('id','pay_wrong')]:
+            previous = payment[key]
+            payment[key] = value
+            r = self.request(self.learner,'/api/credits/verify',body)
+            self.assertIn(r.status_code,(409,502),r.json)
+            payment[key] = previous
+        self.assertEqual(self.sql('SELECT balance FROM credits WHERE user_id=%s',(self.learner,))[0]['balance'],10)
+
+    def test_payment_waits_for_capture_and_webhook_completes_later(self):
+        payment, body = self.payment_fixture()
+        payment.update(status='authorized',captured=False)
+        r = self.request(self.learner,'/api/credits/verify',body)
+        self.assertEqual(r.status_code,202,r.json)
+        self.assertFalse(r.json['paid'])
+        self.assertEqual(self.payment_webhook(payment).status_code,503)
+        self.assertEqual(self.sql('SELECT balance FROM credits WHERE user_id=%s',(self.learner,))[0]['balance'],10)
+        payment.update(status='captured',captured=True)
+        self.assertEqual(self.payment_webhook(payment).status_code,200)
+        self.assertEqual(self.sql('SELECT balance FROM credits WHERE user_id=%s',(self.learner,))[0]['balance'],15)
+
+    def test_refunded_or_failed_payment_never_grants_credits(self):
+        payment, body = self.payment_fixture()
+        for changes in (dict(status='failed',captured=False),dict(status='refunded',captured=True),
+                        dict(status='captured',captured=False),dict(status='captured',captured=True,amount_refunded=100)):
+            payment.update(changes)
+            self.assertEqual(self.request(self.learner,'/api/credits/verify',body).status_code,409)
+        self.assertEqual(self.sql('SELECT balance FROM credits WHERE user_id=%s',(self.learner,))[0]['balance'],10)
+
+    def test_payment_provider_failure_retries_and_fulfillment_rolls_back(self):
+        payment, body = self.payment_fixture()
+        self.payment_lookup.side_effect = backend.requests.Timeout()
+        self.assertEqual(self.payment_webhook(payment).status_code,503)
+        self.payment_lookup.side_effect = None
+        with patch.object(backend,'create_notification',side_effect=RuntimeError('simulated failure')):
+            with self.assertRaises(RuntimeError): self.payment_webhook(payment)
+        self.assertEqual(self.sql('SELECT status FROM credit_payments WHERE provider_order_id=%s',(payment['order_id'],))[0]['status'],'created')
+        self.assertEqual(self.sql('SELECT balance FROM credits WHERE user_id=%s',(self.learner,))[0]['balance'],10)
+        self.assertEqual(self.sql('SELECT COUNT(*) n FROM transactions WHERE user_id=%s',(self.learner,))[0]['n'],0)
+        self.assertEqual(self.payment_webhook(payment).status_code,200)
+
+    def test_donation_webhook_and_browser_retry_do_not_award_credits(self):
+        payment, body = self.payment_fixture(donation=True)
+        self.assertEqual(self.payment_webhook(payment).status_code,200)
+        self.assertEqual(self.request(self.learner,'/api/donations/verify',body).status_code,200)
+        self.assertEqual(self.sql('SELECT balance FROM credits WHERE user_id=%s',(self.learner,))[0]['balance'],10)
+        self.assertEqual(self.sql("SELECT COUNT(*) n FROM notifications WHERE user_id=%s AND type='donation'",(self.learner,))[0]['n'],1)
+
+    def test_live_orders_require_webhook_secret_and_unknown_webhooks_are_ignored(self):
+        payment, body = self.payment_fixture()
+        payment['order_id'] = 'order_unknown'
+        self.assertEqual(self.payment_webhook(payment).status_code,200)
+        self.payment_lookup.assert_not_called()
+        with patch.dict(backend.app.config, RAZORPAY_KEY_ID='rzp_live_audit', RAZORPAY_WEBHOOK_SECRET=''):
+            with patch.object(backend.requests,'post') as create:
+                self.assertEqual(self.request(self.learner,'/api/donations/create',{'amount':10}).status_code,503)
+                self.assertEqual(self.payment_webhook(payment).status_code,503)
+                create.assert_not_called()
+
+    def test_order_creation_uses_server_price_and_does_not_grant_credits(self):
+        self.payment_fixture()
+        package_id, package = next(iter(backend.credit_packages().items()))
+        oid = 'order_'+uuid.uuid4().hex
+        response = Mock(status_code=200)
+        response.json.return_value = dict(id=oid,amount=int(package['price'])*100,currency='INR')
+        with patch.object(backend.requests,'post',return_value=response) as create:
+            r = self.request(self.learner,'/api/credits/purchase',dict(packageId=package_id,amount=1,credits=999999))
+            self.assertEqual(r.status_code,200,r.json)
+            self.assertEqual(create.call_args.kwargs['json']['amount'],int(package['price'])*100)
+            self.assertEqual(self.sql('SELECT credits FROM credit_payments WHERE provider_order_id=%s',(oid,))[0]['credits'],package['credits'])
+            response.json.return_value['currency']='USD'
+            self.assertEqual(self.request(self.learner,'/api/credits/purchase',dict(packageId=package_id)).status_code,502)
+        self.assertEqual(self.sql('SELECT balance FROM credits WHERE user_id=%s',(self.learner,))[0]['balance'],10)
+
+    def test_existing_live_payment_can_finish_while_webhook_is_being_configured(self):
+        payment, body = self.payment_fixture()
+        with patch.dict(backend.app.config, RAZORPAY_KEY_ID='rzp_live_audit', RAZORPAY_WEBHOOK_SECRET=''):
+            self.assertEqual(self.request(self.learner,'/api/credits/verify',body).status_code,200)
 
     def quest(self, key):
         quest = dict(next(q for q in backend.DAILY_QUESTS if q['key'] == key))

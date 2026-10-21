@@ -1563,7 +1563,7 @@ export default function App() {
             notify(verified.message || "Payment successful.");
             await load();
           } catch (error) {
-            notify(error.message || "Payment verification failed.", true);
+            notify(`${error.message || "Payment confirmation is pending."} If money was debited, do not pay again; check your wallet shortly or contact support.`, true);
           }
         },
       });
@@ -1595,7 +1595,7 @@ export default function App() {
             notify(verified.message || "Thank you for supporting GotTime.");
             await load();
           } catch (error) {
-            notify(error.message || "Donation verification failed.", true);
+            notify(`${error.message || "Donation confirmation is pending."} If money was debited, do not pay again; check back shortly or contact support.`, true);
           }
         },
       });
