@@ -8,6 +8,7 @@ import {
 import logoMark from "./assets/gottime-logo.svg";
 import { guardianNotice, meetingUrl, nextLearnerQuiz } from "./sessionRules";
 import { createChatCrypto } from "./chatCrypto";
+import { questDay, questIsCurrent, questCount as dailyQuestCount, questResetDelay } from "./dailyQuest";
 
 const navItems = [
   { id: "home", label: "Home", icon: Home },
@@ -284,7 +285,7 @@ function SkillCardIcon({ skill }) {
 function photoUrl(photo) { return !photo ? "" : /^https?:\/\//i.test(photo) ? photo : `/static/uploads/${photo}`; }
 function buildBadgeVault(data) {
   const earned = new Set((data.badges || []).map((badge) => badge.name));
-  const xp = Number(data.user?.xp || 0);
+  const xp = Number(data.user?.badge_xp ?? data.user?.xp ?? 0);
   const sessions = data.sessions || [];
   const learned = sessions.filter((s) => s.status === "completed" && s.learner_id === data.user.id).length;
   const taught = sessions.filter((s) => s.status === "completed" && s.mentor_id === data.user.id).length;
@@ -294,9 +295,9 @@ function buildBadgeVault(data) {
   const scheduled = sessions.filter((s) => s.scheduled_for && !["cancelled", "missed"].includes(s.status)).length;
   const streak = Number(data.user?.streak || 0);
   const blueprints = [
-    { name: "Curiosity Spark", tier: "XP badge", icon: Zap, color: "mint", shape: "burst", target: 50, value: xp, condition: "Earn 50 XP.", reward: "Spark" },
-    { name: "Knowledge Seeker", tier: "XP badge", icon: BookOpen, color: "violet", shape: "book", target: 250, value: xp, condition: "Reach 250 XP.", reward: "Seeker" },
-    { name: "Time Legend", tier: "XP badge", icon: Trophy, color: "yellow", shape: "crown", target: 500, value: xp, condition: "Reach 500 XP.", reward: "Legend" },
+    { name: "Curiosity Spark", tier: "XP badge", icon: Zap, color: "mint", shape: "burst", target: 50, value: xp, condition: "Earn 50 XP, excluding daily-quest bonus XP.", reward: "Spark" },
+    { name: "Knowledge Seeker", tier: "XP badge", icon: BookOpen, color: "violet", shape: "book", target: 250, value: xp, condition: "Reach 250 XP, excluding daily-quest bonus XP.", reward: "Seeker" },
+    { name: "Time Legend", tier: "XP badge", icon: Trophy, color: "yellow", shape: "crown", target: 500, value: xp, condition: "Reach 500 XP, excluding daily-quest bonus XP.", reward: "Legend" },
     { name: "First Session Completed", tier: "Session badge", icon: Check, color: "blue", shape: "shield", target: 1, value: learned, condition: "Finish 1 session.", reward: "First" },
     { name: "Skill Hunter", tier: "Learning badge", icon: Compass, color: "violet", shape: "diamond", target: 5, value: learned, condition: "Finish 5 learning sessions.", reward: "Hunter" },
     { name: "10 Hours Taught", tier: "Teaching badge", icon: Sparkles, color: "peach", shape: "spark", target: 1, value: taught, condition: "Teach 1 session.", reward: "Mentor" },
@@ -320,35 +321,21 @@ function writePageStack(key, stack) {
   localStorage.setItem(key, JSON.stringify(stack.filter((item) => appPages.includes(item)).slice(-12)));
 }
 function todayKey() {
-  return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+  return questDay();
 }
-function dailyMentorViewsKey(userId) {
-  return `gt-mentor-views-${userId || "guest"}-${todayKey()}`;
+function dailyMentorViewsKey(userId, day = todayKey()) {
+  return `gt-mentor-views-${userId || "guest"}-${day}`;
 }
-function readDailyMentorViews(userId) {
+function readDailyMentorViews(userId, day) {
   try {
-    const views = JSON.parse(localStorage.getItem(dailyMentorViewsKey(userId)) || "[]");
+    const views = JSON.parse(localStorage.getItem(dailyMentorViewsKey(userId, day)) || "[]");
     return Array.isArray(views) ? views.map(Number).filter(Boolean) : [];
   } catch {
     return [];
   }
 }
-function writeDailyMentorViews(userId, views) {
-  localStorage.setItem(dailyMentorViewsKey(userId), JSON.stringify([...new Set(views.map(Number).filter(Boolean))]));
-}
-function dailyQuestProgressKey(userId) {
-  return `gt-daily-quest-progress-${userId || "guest"}-${todayKey()}`;
-}
-function readDailyQuestProgress(userId) {
-  try {
-    const progress = JSON.parse(localStorage.getItem(dailyQuestProgressKey(userId)) || "{}");
-    return progress && typeof progress === "object" ? progress : {};
-  } catch {
-    return {};
-  }
-}
-function writeDailyQuestProgress(userId, progress) {
-  localStorage.setItem(dailyQuestProgressKey(userId), JSON.stringify(progress || {}));
+function writeDailyMentorViews(userId, views, day) {
+  localStorage.setItem(dailyMentorViewsKey(userId, day), JSON.stringify([...new Set(views.map(Number).filter(Boolean))]));
 }
 function fallbackDailyQuest() {
   return { key: "mentor_explorer", title: "Curiosity collector", description: "Explore 2 mentor profiles today.", target: 2, kind: "mentor_views", xp: 50 };
@@ -576,7 +563,7 @@ function SessionRow({ item, user, action, onOpen, openQuiz }) {
     </div>
   </article>;
 }
-function Dashboard({ data, setPage, openBooking, sessionAction, viewedMentors = [], dailyQuestProgress = {} }) {
+function Dashboard({ data, setPage, openBooking, sessionAction, viewedMentors = [] }) {
   const { user, sessions, notifications, transactions, badges } = data;
   const upcoming = sessions.filter((s) => !["completed", "cancelled", "missed"].includes(s.status)).slice(0, 3);
   const learned = sessions.filter((s) => s.status === "completed" && s.learner_id === user.id).length;
@@ -586,9 +573,9 @@ function Dashboard({ data, setPage, openBooking, sessionAction, viewedMentors = 
   const feed = (notifications.filter((n) => n.type !== "message" || !n.is_read).length ? notifications.filter((n) => n.type !== "message" || !n.is_read) : transactions).slice(0, 3);
   const quest = data.dailyQuest || fallbackDailyQuest();
   const questTarget = Number(quest.target || 1);
-  const questCount = data.dailyQuestClaimed ? questTarget : quest.kind === "mentor_views" ? Math.min(questTarget, new Set(viewedMentors).size) : 0;
+  const questCount = dailyQuestCount(data, viewedMentors);
   const questProgress = `${(questCount / questTarget) * 100}%`;
-  return <div className="page dashboard-page"><section className="welcome-banner"><div><h1>Hey {user.username.split(" ")[0]}, what will you<br /><em>unlock today?</em></h1><p>Every hour shared makes the whole exchange richer.</p><div className="banner-actions"><button className="primary" onClick={() => setPage("discover")}>Find a mentor <ArrowRight size={17} /></button><button className="soft-button" onClick={() => setPage("skills")}><Plus size={17} /> Share a skill</button></div></div><div className="quest-ring" style={{ "--quest-progress": `${xp}%` }}><div><Sparkles size={25} /><strong>{totalXp}</strong><span>total XP</span></div></div></section><section className="stats-grid"><StatCard icon={Clock3} label="Time credits" value={`${user.credits}h`} note="Available balance" /><StatCard icon={Zap} label="XP earned" value={totalXp} note="XP badges: 50, 250, 500" tone="mint" /><StatCard icon={BookOpen} label="Skills learned" value={learned} note="Keep exploring" tone="violet" /><StatCard icon={Sparkles} label="Hours shared" value={`${taught}h`} note="Your teaching impact" tone="blue" /></section><div className="dashboard-columns"><section className="content-card sessions-card"><div className="card-head"><div><h3>Up next</h3><p>Your learning calendar</p></div><button className="text-button" onClick={() => setPage("sessions")}>View all <ArrowRight size={15} /></button></div><div className="session-list">{upcoming.length ? upcoming.map((item) => <SessionRow key={item.id} item={item} user={user} action={sessionAction} onOpen={() => setPage("calendar")} />) : <EmptyState icon={CalendarDays} title="Your calendar is wide open" text="Find someone brilliant and book your first skill swap." action="Browse mentors" onAction={openBooking} />}</div></section><section className={`content-card daily-quest ${data.dailyQuestClaimed ? "completed" : ""}`}><div className="card-head"><div><h3>Daily quest</h3><p>{data.dailyQuestClaimed ? "Resets tomorrow" : "Resets later today"}</p></div><span className={`xp-chip ${data.dailyQuestClaimed ? "claimed" : ""}`}>{data.dailyQuestClaimed ? "Completed" : `+${quest.xp || 50} XP`}</span></div><div className="quest-art"><Target size={34} /></div><h4>{quest.title}</h4><p>{quest.description}</p><div className="progress"><span style={{ width: questProgress }} /></div><small>{`${questCount} of ${questTarget} done`}</small></section></div><div className="dashboard-columns lower"><section className="content-card activity-card"><div className="card-head"><div><h3>Your momentum</h3><p>Hours invested over 6 weeks</p></div></div><div className="mini-chart empty-chart">{[0, 0, 0, 0, 0, 0].map((h, i) => <div key={i}><span style={{ height: `${h}%` }} /><small>W{i + 1}</small></div>)}</div></section><section className="content-card feed-card"><div className="card-head"><div><h3>Updates</h3><p>Things worth checking</p></div><button className="text-button" onClick={() => setPage("notifications")}>View all <ArrowRight size={15} /></button></div>{feed.length ? feed.map((item, i) => <button className={`feed-item ${String(item.message || item.note || "").toLowerCase().includes("missed") ? "missed-notification" : ""}`} key={item.id || i} onClick={() => setPage("notifications")}><span className={`feed-icon ${gradients[i]}`}>{item.type === "badge" ? <Award size={17} /> : item.type === "xp" ? <Zap size={17} /> : item.kind === "earned" ? <Coins size={17} /> : <Bell size={17} />}</span><div><b>{item.type === "message" && item.sender_name ? `${item.sender_name} sent you a message` : item.message || item.note}</b><small>{formatDate(item.created_at)}</small></div></button>) : <EmptyState icon={Bell} title="No updates yet" text="New session, badge, and credit updates will appear here." />}</section></div><DashboardTestimonials setPage={setPage} /></div>;
+  return <div className="page dashboard-page"><section className="welcome-banner"><div><h1>Hey {user.username.split(" ")[0]}, what will you<br /><em>unlock today?</em></h1><p>Every hour shared makes the whole exchange richer.</p><div className="banner-actions"><button className="primary" onClick={() => setPage("discover")}>Find a mentor <ArrowRight size={17} /></button><button className="soft-button" onClick={() => setPage("skills")}><Plus size={17} /> Share a skill</button></div></div><div className="quest-ring" style={{ "--quest-progress": `${xp}%` }}><div><Sparkles size={25} /><strong>{totalXp}</strong><span>total XP</span></div></div></section><section className="stats-grid"><StatCard icon={Clock3} label="Time credits" value={`${user.credits}h`} note="Available balance" /><StatCard icon={Zap} label="XP earned" value={totalXp} note="Includes daily-quest bonus XP" tone="mint" /><StatCard icon={BookOpen} label="Skills learned" value={learned} note="Keep exploring" tone="violet" /><StatCard icon={Sparkles} label="Hours shared" value={`${taught}h`} note="Your teaching impact" tone="blue" /></section><div className="dashboard-columns"><section className="content-card sessions-card"><div className="card-head"><div><h3>Up next</h3><p>Your learning calendar</p></div><button className="text-button" onClick={() => setPage("sessions")}>View all <ArrowRight size={15} /></button></div><div className="session-list">{upcoming.length ? upcoming.map((item) => <SessionRow key={item.id} item={item} user={user} action={sessionAction} onOpen={() => setPage("calendar")} />) : <EmptyState icon={CalendarDays} title="Your calendar is wide open" text="Find someone brilliant and book your first skill swap." action="Browse mentors" onAction={openBooking} />}</div></section><section className={`content-card daily-quest ${data.dailyQuestClaimed ? "completed" : ""}`}><div className="card-head"><div><h3>Daily quest</h3><p>Resets at midnight IST · Bonus XP only</p></div><span className={`xp-chip ${data.dailyQuestClaimed ? "claimed" : ""}`}>{data.dailyQuestClaimed ? "Completed" : `+${quest.xp || 50} XP`}</span></div><div className="quest-art"><Target size={34} /></div><h4>{quest.title}</h4><p>{quest.description}</p><div className="progress"><span style={{ width: questProgress }} /></div><small>{`${questCount} of ${questTarget} done`}</small></section></div><div className="dashboard-columns lower"><section className="content-card activity-card"><div className="card-head"><div><h3>Your momentum</h3><p>Hours invested over 6 weeks</p></div></div><div className="mini-chart empty-chart">{[0, 0, 0, 0, 0, 0].map((h, i) => <div key={i}><span style={{ height: `${h}%` }} /><small>W{i + 1}</small></div>)}</div></section><section className="content-card feed-card"><div className="card-head"><div><h3>Updates</h3><p>Things worth checking</p></div><button className="text-button" onClick={() => setPage("notifications")}>View all <ArrowRight size={15} /></button></div>{feed.length ? feed.map((item, i) => <button className={`feed-item ${String(item.message || item.note || "").toLowerCase().includes("missed") ? "missed-notification" : ""}`} key={item.id || i} onClick={() => setPage("notifications")}><span className={`feed-icon ${gradients[i]}`}>{item.type === "badge" ? <Award size={17} /> : item.type === "xp" ? <Zap size={17} /> : item.kind === "earned" ? <Coins size={17} /> : <Bell size={17} />}</span><div><b>{item.type === "message" && item.sender_name ? `${item.sender_name} sent you a message` : item.message || item.note}</b><small>{formatDate(item.created_at)}</small></div></button>) : <EmptyState icon={Bell} title="No updates yet" text="New session, badge, and credit updates will appear here." />}</section></div><DashboardTestimonials setPage={setPage} /></div>;
 }
 
 function Discover({ data, openMentor }) {
@@ -1149,11 +1136,39 @@ function SkillModal({ onClose, onAdded, initialSkill }) {
   return <Modal title={isEditing ? "Edit your skill" : "Share what you know"} subtitle={isEditing ? "Update the skill name, category, mode, or pitch." : "You don't need to be world-class-just one chapter ahead."} onClose={onClose}><form className="modal-form" onSubmit={submit}><label>Skill name<input required value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></label><label>Category<div className={`custom-select ${categoryOpen ? "open" : ""}`}><button type="button" className="custom-select-trigger" onClick={() => setCategoryOpen(!categoryOpen)}><span>{form.category === "Other" && form.customCategory.trim() ? form.customCategory.trim() : form.category}</span><ChevronDown size={18} /></button>{categoryOpen && <div className="custom-select-menu">{categories.map((c) => <button type="button" key={c} className={form.category === c ? "active" : ""} onClick={() => { setForm({ ...form, category: c }); setCategoryOpen(false); }}>{categoryEmoji[c] && <i>{categoryEmoji[c]}</i>}<span>{c}</span>{form.category === c && <Check size={15} />}</button>)}</div>}</div></label>{form.category === "Other" && <label>Custom category<input required autoFocus value={form.customCategory} onChange={(e) => setForm({ ...form, customCategory: e.target.value })} placeholder="Example: Video editing" /></label>}<label>Preferred session mode<div className="mode-pick skill-mode-pick"><button type="button" className={form.availability === "online" ? "active" : ""} onClick={() => setForm({ ...form, availability: "online" })}><Video size={16} /> Online</button><button type="button" className={form.availability === "offline" ? "active" : ""} onClick={() => setForm({ ...form, availability: "offline" })}><Users size={16} /> Offline</button><button type="button" className={form.availability === "both" ? "active" : ""} onClick={() => setForm({ ...form, availability: "both" })}><Sparkles size={16} /> Both</button></div></label><div className="time-range-fields"><ThemedTimePicker label="Available from" value={timeRange.start} onChange={(value) => setTimeRange({ ...timeRange, start: value })} /><ThemedTimePicker label="Available until" value={timeRange.end} onChange={(value) => setTimeRange({ ...timeRange, end: value })} /></div><label>Short pitch<textarea rows="3" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} /></label><button className="primary full">{isEditing ? "Save skill" : <>Add to my skill deck <Plus size={17} /></>}</button></form></Modal>;
 }
 function Reward({ reward, onClose }) {
+  if (reward?.type === "questXp") {
+    return <div className="reward-backdrop">
+      <section className="reward-card" role="dialog" aria-modal="true" aria-label="Daily quest complete">
+        <div className="reward-burst"><Zap size={46} /></div>
+        <span className="eyebrow">Daily quest complete</span>
+        <h2>+{reward.xp} bonus XP!</h2>
+        <p>{reward.name} completed. Your XP has been added automatically. Daily quests award bonus XP only, not badges.</p>
+        <button className="primary full" onClick={onClose}>Keep going <ArrowRight size={17} /></button>
+      </section>
+    </div>;
+  }
   const isXpBadge = reward?.type === "xpBadge";
-  const isQuestBadge = reward?.type === "questBadge";
   const isSkillBadge = reward?.type === "skillBadge";
-  const isLootBadge = isXpBadge || isSkillBadge || isQuestBadge;
-  return <div className={`reward-backdrop loot-backdrop ${isLootBadge ? "xp-loot-backdrop" : ""}`}><div className="loot-rays">{Array.from({ length: 12 }).map((_, i) => <i key={i} style={{ "--i": i }} />)}</div><div className="loot-confetti">{Array.from({ length: isLootBadge ? 34 : 18 }).map((_, i) => <i key={i} style={{ "--i": i }} />)}</div><section className={`reward-card loot-card ${isLootBadge ? "xp-loot-card" : ""}`}><div className="loot-rings"><span /><span /><span /></div><div className={`reward-burst loot-medal ${isLootBadge ? "xp-loot-medal" : ""}`}>{isXpBadge || isQuestBadge ? <Zap size={46} /> : isSkillBadge ? <Sparkles size={46} /> : <Trophy size={42} />}<Sparkles className="loot-spark spark-one" size={18} /><Sparkles className="loot-spark spark-two" size={16} /></div><span className="eyebrow">{isXpBadge ? "XP badge unlocked" : isQuestBadge ? "Daily quest complete" : isSkillBadge ? "Skill badge unlocked" : "Rare badge unlocked"}</span><h2>{isXpBadge ? `${reward.name || "Curiosity Spark"} unlocked!` : isQuestBadge ? `${reward.name || "Quest badge"} unlocked!` : isSkillBadge ? `${reward.name || "Skill Sharer"} unlocked!` : "Session mastered!"}</h2><p>{isXpBadge ? "You crossed 50 XP. Curiosity paid off - your first XP badge just dropped into the vault." : isQuestBadge ? "Quest finished. XP earned, progress saved, and your reward dropped into the vault." : isSkillBadge ? "Your first teachable skill is live. The Skill Sharer badge just dropped into your vault." : "Both sides confirmed the session. Your credits, badges, and achievements have been added to your profile."}</p><div className="reward-points loot-rewards"><div><Award size={24} /><b>{isXpBadge ? "Curiosity Spark" : isQuestBadge ? reward.name || "Daily Quest" : isSkillBadge ? "Skill Sharer" : "New badge"}</b><span>{isXpBadge ? "First XP badge" : isQuestBadge ? "Quest reward" : isSkillBadge ? "Teaching badge" : "Achievement earned"}</span></div><div>{isXpBadge || isQuestBadge ? <Zap size={24} /> : isSkillBadge ? <BookOpen size={24} /> : <Coins size={24} />}<b>{isXpBadge ? "+50 XP" : isQuestBadge ? `+${reward.xp || 50} XP` : isSkillBadge ? "Skill live" : "Credits updated"}</b><span>{isXpBadge || isQuestBadge ? "XP reward" : isSkillBadge ? "Now discoverable" : "Time trade complete"}</span></div></div><button className="primary full receive-reward" onClick={onClose}>{isLootBadge ? "Claim badge" : "Receive reward"} <Sparkles size={17} /></button></section></div>;
+  const isLootBadge = isXpBadge || isSkillBadge;
+  return <div className={`reward-backdrop loot-backdrop ${isLootBadge ? "xp-loot-backdrop" : ""}`}>
+    <div className="loot-rays">{Array.from({ length: 12 }).map((_, i) => <i key={i} style={{ "--i": i }} />)}</div>
+    <div className="loot-confetti">{Array.from({ length: isLootBadge ? 34 : 18 }).map((_, i) => <i key={i} style={{ "--i": i }} />)}</div>
+    <section className={`reward-card loot-card ${isLootBadge ? "xp-loot-card" : ""}`}>
+      <div className="loot-rings"><span /><span /><span /></div>
+      <div className={`reward-burst loot-medal ${isLootBadge ? "xp-loot-medal" : ""}`}>
+        {isXpBadge ? <Zap size={46} /> : isSkillBadge ? <Sparkles size={46} /> : <Trophy size={42} />}
+        <Sparkles className="loot-spark spark-one" size={18} /><Sparkles className="loot-spark spark-two" size={16} />
+      </div>
+      <span className="eyebrow">{isXpBadge ? "XP badge unlocked" : isSkillBadge ? "Skill badge unlocked" : "Rare badge unlocked"}</span>
+      <h2>{isXpBadge ? `${reward.name || "Curiosity Spark"} unlocked!` : isSkillBadge ? `${reward.name || "Skill Sharer"} unlocked!` : "Session mastered!"}</h2>
+      <p>{isXpBadge ? "You crossed 50 badge-eligible XP. Your first XP badge just dropped into the vault." : isSkillBadge ? "Your first teachable skill is live. The Skill Sharer badge just dropped into your vault." : "Both sides confirmed the session. Your credits, badges, and achievements have been added to your profile."}</p>
+      <div className="reward-points loot-rewards">
+        <div><Award size={24} /><b>{isXpBadge ? "Curiosity Spark" : isSkillBadge ? "Skill Sharer" : "New badge"}</b><span>{isXpBadge ? "First XP badge" : isSkillBadge ? "Teaching badge" : "Achievement earned"}</span></div>
+        <div>{isXpBadge ? <Zap size={24} /> : isSkillBadge ? <BookOpen size={24} /> : <Coins size={24} />}<b>{isXpBadge ? "50 XP milestone" : isSkillBadge ? "Skill live" : "Credits updated"}</b><span>{isXpBadge ? "Badge-eligible XP" : isSkillBadge ? "Now discoverable" : "Time trade complete"}</span></div>
+      </div>
+      <button className="primary full receive-reward" onClick={onClose}>{isLootBadge ? "Claim badge" : "Receive reward"} <Sparkles size={17} /></button>
+    </section>
+  </div>;
 }
 function Toast({ message, error }) { return <div className={`toast ${error ? "toast-error" : ""}`}><span>{error ? <X size={16} /> : <Check size={16} />}</span>{message}</div>; }
 function ConfirmDialog({ title = "Are you sure?", message, confirmLabel = "Yes, remove it", danger = false, busy = false, onConfirm, onClose }) {
@@ -1180,9 +1195,8 @@ export default function App() {
   const [appRatingPrompt, setAppRatingPrompt] = useState(null), [appRatingScore, setAppRatingScore] = useState(5), [appRatingFeedback, setAppRatingFeedback] = useState(""), [appRatingBusy, setAppRatingBusy] = useState(false);
   const [entryChoice, setEntryChoice] = useState(() => localStorage.getItem("gt-entry-choice") || (currentAuthToken() || localStorage.getItem("gt-page") || localStorage.getItem("gt-theme") ? "user" : ""));
   const [viewedMentors, setViewedMentors] = useState([]);
-  const [dailyQuestProgress, setDailyQuestProgress] = useState({});
   const [swipeHint, setSwipeHint] = useState(null);
-  const pageHistory = useRef(readPageStack("gt-page-history")), forwardHistory = useRef(readPageStack("gt-forward-history")), publicHistory = useRef([]), publicForward = useRef([]), touchStart = useRef(null), trackpadSwipe = useRef({ x: 0, y: 0, last: 0 }), dailyQuestClaiming = useRef(false), previousQuestPage = useRef(page), legacyMessageMigration = useRef(new Set()), splashQuote = useRef(randomQuote(new Date().getMinutes()));
+  const pageHistory = useRef(readPageStack("gt-page-history")), forwardHistory = useRef(readPageStack("gt-forward-history")), publicHistory = useRef([]), publicForward = useRef([]), touchStart = useRef(null), trackpadSwipe = useRef({ x: 0, y: 0, last: 0 }), dailyQuestClaiming = useRef(false), legacyMessageMigration = useRef(new Set()), splashQuote = useRef(randomQuote(new Date().getMinutes()));
   const notify = (message, error = false) => { setToast({ message, error }); setTimeout(() => setToast(null), 3200); };
   const load = async () => {
     if (loadingData.current) return;
@@ -1270,7 +1284,23 @@ export default function App() {
         }
       });
   }, []);
-  useEffect(() => { if (user?.id) { setViewedMentors(readDailyMentorViews(user.id)); setDailyQuestProgress(readDailyQuestProgress(user.id)); } }, [user?.id]);
+  useEffect(() => {
+    setViewedMentors(user?.id ? readDailyMentorViews(user.id, data?.dailyQuest?.date) : []);
+    dailyQuestClaiming.current = false;
+  }, [user?.id, data?.dailyQuest?.date]);
+  useEffect(() => {
+    if (!data?.user?.id) return;
+    const refreshOnReturn = () => { if (!document.hidden) load(); };
+    const delay = questResetDelay(data.dailyQuest);
+    const timer = delay === null ? null : setTimeout(refreshOnReturn, delay);
+    window.addEventListener("focus", refreshOnReturn);
+    document.addEventListener("visibilitychange", refreshOnReturn);
+    return () => {
+      clearTimeout(timer);
+      window.removeEventListener("focus", refreshOnReturn);
+      document.removeEventListener("visibilitychange", refreshOnReturn);
+    };
+  }, [data?.user?.id, data?.dailyQuest?.date]);
   useEffect(() => { if (user?.id && user.id !== "restoring") ensureMessageKey(user.id).catch(() => {}); }, [user?.id]);
   useEffect(() => {
     if (!data?.user?.id) return;
@@ -1282,7 +1312,7 @@ export default function App() {
     if (unseen.length) setMissedPopup(unseen);
   }, [data?.user?.id, data?.sessions]);
   // Legacy encryption runs only for the opened chat, so unopened messages stay unread.
-  useEffect(() => { dailyQuestClaiming.current = Boolean(data?.dailyQuestClaimed); }, [data?.dailyQuestClaimed]);
+  useEffect(() => { dailyQuestClaiming.current = Boolean(data?.dailyQuestClaimed); }, [data?.dailyQuestClaimed, data?.dailyQuest?.date]);
   useEffect(() => {
     if (!data?.user?.id) return;
     const hasFirstXpBadge = (data.badges || []).some((badge) => badge.name === "Curiosity Spark");
@@ -1648,17 +1678,19 @@ export default function App() {
     } catch (e) { notify(e.message, true); throw e; }
   };
   const readNotifications = async () => { try { await api("/api/notifications/read", { method: "POST" }); await load(); } catch (e) { notify(e.message, true); } };
-  const claimDailyQuest = async ({ mentorIds = [], progress = 0 } = {}) => {
-    const quest = data?.dailyQuest || fallbackDailyQuest();
+  const claimDailyQuest = async () => {
+    const quest = data?.dailyQuest;
+    if (!questIsCurrent(quest)) return;
     const target = Number(quest.target || 1);
-    const currentProgress = quest.kind === "mentor_views" ? mentorIds.length : progress;
+    const mentorIds = readDailyMentorViews(user.id, quest.date);
+    const currentProgress = dailyQuestCount(data, mentorIds);
     if (dailyQuestClaiming.current || data?.dailyQuestClaimed || currentProgress < target) return;
     dailyQuestClaiming.current = true;
     try {
-      const result = await api("/api/quests/daily-curiosity", { method: "POST", body: JSON.stringify({ quest_key: quest.key, mentor_ids: mentorIds, progress: currentProgress }) });
+      const result = await api("/api/quests/daily-curiosity", { method: "POST", body: JSON.stringify({ quest_key: quest.key, quest_date: quest.date, mentor_ids: mentorIds }) });
       if (result.awarded) {
-        if (Number(data?.user?.xp || 0) < 50 && Number(result.xp || 0) >= 50) localStorage.setItem(`gt-reward-seen-${user.id}-curiosity-spark`, "1");
-        setReward({ type: "questBadge", name: quest.title || "Daily Quest", xp: quest.xp || 50 });
+        setReward((current) => current || { type: "questXp", name: quest.title, xp: quest.xp });
+        notify(`Daily quest complete: +${quest.xp} bonus XP!`);
       } else {
         notify(result.message || (result.awarded ? "+50 XP earned!" : "Daily quest already claimed."));
       }
@@ -1666,24 +1698,17 @@ export default function App() {
     } catch (e) {
       dailyQuestClaiming.current = false;
       notify(e.message, true);
+      if (e.status === 409) await load();
     }
   };
-  const updateDailyQuestProgress = (key, progress) => {
-    if (!user?.id || !key) return;
-    setDailyQuestProgress((current) => {
-      const next = { ...current, [key]: Math.max(Number(current[key] || 0), Number(progress || 0)) };
-      writeDailyQuestProgress(user.id, next);
-      return next;
-    });
-  };
   const trackMentorView = (mentorId) => {
-    if (!user?.id || !mentorId) return;
-    setViewedMentors((current) => {
-      const next = [...new Set([...current, Number(mentorId)].filter(Boolean))];
-      writeDailyMentorViews(user.id, next);
-      if ((data?.dailyQuest || fallbackDailyQuest()).kind === "mentor_views") claimDailyQuest({ mentorIds: next });
-      return next;
-    });
+    const quest = data?.dailyQuest;
+    if (!user?.id || !mentorId || Number(mentorId) === Number(user.id) || !questIsCurrent(quest)) return;
+    const current = readDailyMentorViews(user.id, quest.date);
+    if (current.includes(Number(mentorId))) return;
+    const next = [...new Set([...current, Number(mentorId)])];
+    writeDailyMentorViews(user.id, next, quest.date);
+    setViewedMentors(next);
   };
   const openChat = (id) => { setSelectedContactId(Number(id)); goToPage("messages"); };
   const openMentor = (mentor) => {
@@ -1695,17 +1720,12 @@ export default function App() {
   const openProfile = (profile) => { goToPage("profile"); setSelectedProfile(profile?.id === data?.user?.id ? null : profile); };
   const openNotification = (item) => item.type === "message" && item.target_contact_id ? openChat(item.target_contact_id) : goToPage(item.type === "session" ? "sessions" : "notifications");
   useEffect(() => {
-    const quest = data?.dailyQuest;
-    const cameFromAnotherPage = previousQuestPage.current !== page;
-    previousQuestPage.current = page;
-    if (!cameFromAnotherPage || !user?.id || !quest || data?.dailyQuestClaimed || quest.kind !== "page_visit" || quest.page !== page) return;
-    updateDailyQuestProgress(quest.key, 1);
-    claimDailyQuest({ progress: 1 });
-  }, [page, data?.dailyQuest?.key, data?.dailyQuestClaimed, user?.id]);
+    if (user?.id && data?.dailyQuest && !data.dailyQuestClaimed) claimDailyQuest();
+  }, [viewedMentors, data?.dailyQuest?.date, data?.dailyQuest?.key, data?.dailyQuestProgress, data?.dailyQuestClaimed, user?.id]);
   const content = useMemo(() => {
     if (!data) return null; const props = { data, setPage: goToPage };
-    return { home: <Dashboard {...props} openBooking={() => goToPage("discover")} sessionAction={sessionAction} viewedMentors={viewedMentors} dailyQuestProgress={dailyQuestProgress} />, discover: <Discover {...props} openMentor={openMentor} />, "mentor-detail": <MentorDetailPage {...props} mentor={selectedMentor} openBooking={(mentor) => setBooking({ mentor })} openChat={openChat} onMentorViewed={trackMentorView} saveBanner={saveBanner} />, sessions: <SessionsPage {...props} action={sessionAction} openBooking={() => goToPage("discover")} openQuiz={openQuiz} />, calendar: <CalendarPage {...props} />, skills: <SkillsPage {...props} openSkill={() => setSkillModal({ mode: "add" })} editSkill={(skill) => setSkillModal({ mode: "edit", skill })} askRemoveSkill={askRemoveSkill} />, badges: <BadgeVault {...props} />, messages: <MessagesPage {...props} refreshData={load} selectedContactId={selectedContactId} sessionAction={sessionAction} showReward={setReward} />, notifications: <NotificationsPage {...props} onNotificationClick={openNotification} />, leaderboard: <Leaderboard {...props} onOpenProfile={openProfile} />, profile: <Profile {...props} saveProfile={saveProfile} uploadPhoto={uploadProfilePhoto} profileUser={selectedProfile} />, subscription: <SubscriptionPage {...props} buyCredits={buyCredits} />, donation: <DonationPage {...props} donateSupport={donateSupport} />, testimonials: <TestimonialsPage {...props} />, about: <AboutPage {...props} />, admin: <AdminPage {...props} notify={notify} /> }[page];
-  }, [data, page, selectedContactId, selectedProfile, selectedMentor, viewedMentors, dailyQuestProgress]);
+    return { home: <Dashboard {...props} openBooking={() => goToPage("discover")} sessionAction={sessionAction} viewedMentors={viewedMentors} />, discover: <Discover {...props} openMentor={openMentor} />, "mentor-detail": <MentorDetailPage {...props} mentor={selectedMentor} openBooking={(mentor) => setBooking({ mentor })} openChat={openChat} onMentorViewed={trackMentorView} saveBanner={saveBanner} />, sessions: <SessionsPage {...props} action={sessionAction} openBooking={() => goToPage("discover")} openQuiz={openQuiz} />, calendar: <CalendarPage {...props} />, skills: <SkillsPage {...props} openSkill={() => setSkillModal({ mode: "add" })} editSkill={(skill) => setSkillModal({ mode: "edit", skill })} askRemoveSkill={askRemoveSkill} />, badges: <BadgeVault {...props} />, messages: <MessagesPage {...props} refreshData={load} selectedContactId={selectedContactId} sessionAction={sessionAction} showReward={setReward} />, notifications: <NotificationsPage {...props} onNotificationClick={openNotification} />, leaderboard: <Leaderboard {...props} onOpenProfile={openProfile} />, profile: <Profile {...props} saveProfile={saveProfile} uploadPhoto={uploadProfilePhoto} profileUser={selectedProfile} />, subscription: <SubscriptionPage {...props} buyCredits={buyCredits} />, donation: <DonationPage {...props} donateSupport={donateSupport} />, testimonials: <TestimonialsPage {...props} />, about: <AboutPage {...props} />, admin: <AdminPage {...props} notify={notify} /> }[page];
+  }, [data, page, selectedContactId, selectedProfile, selectedMentor, viewedMentors]);
   if (user === undefined) return <div className="splash"><Logo /><LoadingQuote quote={splashQuote.current} /><div className="loading-dots"><i /><i /><i /></div></div>;
   if (!user && !entryChoice && !authMode) return <div className="public-shell" onWheel={handleTrackpadWheel} onTouchStart={handleTouchStart} onTouchMove={handleTouchMove} onTouchEnd={handleTouchEnd}><SwipeHint direction={swipeHint} /><GuestLanding onAuth={goToAuth} /></div>;
   if (!user && (authMode || entryChoice === "admin")) return <div className="public-shell" onWheel={handleTrackpadWheel} onTouchStart={handleTouchStart} onTouchMove={handleTouchMove} onTouchEnd={handleTouchEnd}><SwipeHint direction={swipeHint} /><Auth initialMode={authMode === "admin" ? "login" : authMode || "login"} adminOnly={authMode === "admin" || entryChoice === "admin"} onBack={goBackPublic} onAuth={enterApp} /></div>;

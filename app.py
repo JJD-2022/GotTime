@@ -313,16 +313,13 @@ def minimal_app_payload(error: str = ""):
                 )
                 badges_data = cursor.fetchall()
             if db_table_exists("xp_events"):
-                cursor.execute(
-                    """SELECT COUNT(*) AS count FROM xp_events
-                       WHERE user_id = %s AND event_key = %s AND event_date = %s""",
-                    (user_id, daily_quest["event_key"], today_ist()),
-                )
-                daily_quest_claimed = cursor.fetchone()["count"] > 0
+                daily_quest_claimed = has_daily_quest_claim(user_id, daily_quest)
     except Exception as exc:
         app.logger.exception("Minimal app payload also hit a non-fatal issue: %s", exc)
         raise
     user = current_user()
+    user["badge_xp"] = badge_eligible_xp(user_id, user.get("xp", 0))
+    quest_progress = daily_quest["target"] if daily_quest_claimed else daily_quest_progress(user_id, daily_quest)
     payload = {
         "user": user,
         "sessions": sessions_data,
@@ -334,6 +331,7 @@ def minimal_app_payload(error: str = ""):
         "badges": badges_data,
         "dailyQuest": daily_quest,
         "dailyQuestClaimed": daily_quest_claimed,
+        "dailyQuestProgress": quest_progress,
         "leaderboard": leaderboard,
         "contacts": contacts,
         "unreadMessages": unread_messages,
@@ -1099,37 +1097,51 @@ def db_table_exists(table: str) -> bool:
 
 DAILY_QUESTS = (
     {
+        "key": "mentor_spotlight",
+        "title": "Mentor scout",
+        "description": "Check out 1 mentor profile today.",
+        "target": 1,
+        "kind": "mentor_views",
+        "xp": 50,
+    },
+    {
+        "key": "book_one",
+        "title": "Make a learning plan",
+        "description": "Book 1 session today. The session itself can be on a later date.",
+        "target": 1,
+        "kind": "book_sessions",
+        "xp": 50,
+    },
+    {
+        "key": "complete_one",
+        "title": "Show up and grow",
+        "description": "Complete 1 session today as a learner or mentor. Both sides must confirm.",
+        "target": 1,
+        "kind": "complete_sessions",
+        "xp": 50,
+    },
+    {
         "key": "mentor_explorer",
         "title": "Curiosity collector",
-        "description": "Explore 2 mentor profiles today.",
+        "description": "Explore 2 different mentor profiles today.",
         "target": 2,
         "kind": "mentor_views",
         "xp": 50,
     },
     {
-        "key": "mentor_spotlight",
-        "title": "Mentor scout",
-        "description": "Open 1 mentor profile today.",
-        "target": 1,
-        "kind": "mentor_views",
+        "key": "book_two",
+        "title": "Plan your next steps",
+        "description": "Book 2 different sessions today. They can take place on later dates.",
+        "target": 2,
+        "kind": "book_sessions",
         "xp": 50,
     },
     {
-        "key": "discover_visit",
-        "title": "Skill window",
-        "description": "Browse the mentor list today.",
-        "target": 1,
-        "kind": "page_visit",
-        "page": "discover",
-        "xp": 50,
-    },
-    {
-        "key": "skill_deck_visit",
-        "title": "Skill check",
-        "description": "Review your skill deck today.",
-        "target": 1,
-        "kind": "page_visit",
-        "page": "skills",
+        "key": "complete_two",
+        "title": "Double the learning",
+        "description": "Complete 2 sessions today as a learner or mentor. Both sides must confirm each one.",
+        "target": 2,
+        "kind": "complete_sessions",
         "xp": 50,
     },
 )
@@ -1143,7 +1155,73 @@ def current_daily_quest():
     today = today_ist()
     quest = dict(DAILY_QUESTS[today.toordinal() % len(DAILY_QUESTS)])
     quest["event_key"] = f"daily_quest_{quest['key']}"
+    quest["date"] = today.isoformat()
+    quest["resets_at"] = f"{(today + timedelta(days=1)).isoformat()}T00:00:00+05:30"
     return quest
+
+
+def daily_quest_progress(user_id, quest, mentor_ids=()):
+    """Use persisted bookings/completion ledgers, never client-supplied counts."""
+    start = datetime.fromisoformat(quest["date"])
+    end = start + timedelta(days=1)
+    with get_db().cursor() as cursor:
+        if quest["kind"] == "mentor_views":
+            if not isinstance(mentor_ids, (list, tuple)) or len(mentor_ids) > 100:
+                return 0
+            ids = set()
+            for mid in mentor_ids:
+                value = str(mid)
+                if value.isascii() and value.isdigit() and len(value) <= 10 and 0 < int(value) <= 2147483647:
+                    ids.add(int(value))
+            ids.discard(user_id)
+            if not ids:
+                return 0
+            placeholders = ",".join(["%s"] * len(ids))
+            cursor.execute(
+                f"""SELECT COUNT(DISTINCT u.id) AS count FROM users u
+                    JOIN user_skills us ON us.user_id = u.id
+                    WHERE u.is_active = 1 AND u.id IN ({placeholders})""", tuple(ids),
+            )
+        elif quest["kind"] == "book_sessions":
+            cursor.execute(
+                """SELECT COUNT(*) AS count FROM sessions
+                   WHERE learner_id = %s AND created_at >= %s AND created_at < %s
+                     AND status NOT IN ('cancelled', 'missed')""", (user_id, start, end),
+            )
+        elif quest["kind"] == "complete_sessions":
+            # The reward ledger timestamps the confirmed completion, not the booking date.
+            cursor.execute(
+                """SELECT COUNT(DISTINCT s.id) AS count FROM sessions s
+                   JOIN transactions t ON t.related_session_id = s.id
+                   WHERE t.user_id = %s AND (s.learner_id = %s OR s.mentor_id = %s)
+                     AND s.status = 'completed'
+                     AND t.note IN ('Learning session', 'Teaching reward')
+                     AND t.created_at >= %s AND t.created_at < %s""",
+                (user_id, user_id, user_id, start, end),
+            )
+        else:
+            return 0
+        return min(int(quest["target"]), cursor.fetchone()["count"])
+
+
+def has_daily_quest_claim(user_id, quest):
+    # Include older quest keys so a deployment/rotation change cannot pay twice in one day.
+    with get_db().cursor() as cursor:
+        cursor.execute(
+            """SELECT COUNT(*) AS count FROM xp_events
+               WHERE user_id = %s AND event_date = %s AND LEFT(event_key, 11) = 'daily_quest'""",
+            (user_id, quest["date"]),
+        )
+        return cursor.fetchone()["count"] > 0
+
+
+def badge_eligible_xp(user_id, total_xp):
+    with get_db().cursor() as cursor:
+        cursor.execute(
+            """SELECT COALESCE(SUM(amount), 0) AS bonus FROM xp_events
+               WHERE user_id = %s AND LEFT(event_key, 11) = 'daily_quest'""", (user_id,),
+        )
+        return max(0, int(total_xp) - int(cursor.fetchone()["bonus"]))
 
 
 def award_badges(user_id: int):
@@ -1174,7 +1252,7 @@ def award_badges(user_id: int):
 
         cursor.execute("SELECT COALESCE(xp, 0) AS xp, COALESCE(streak, 0) AS streak FROM users WHERE id = %s", (user_id,))
         xp_row = cursor.fetchone()
-        xp = xp_row["xp"] if xp_row else 0
+        xp = badge_eligible_xp(user_id, xp_row["xp"] if xp_row else 0)
         streak = xp_row["streak"] if xp_row else 0
 
         cursor.execute("SELECT id, name FROM badges")
@@ -1235,8 +1313,8 @@ def sync_reversible_badges(user_id: int):
         app.logger.warning("Reversible badge sync skipped: %s", exc)
 
 
-def award_xp(user_id: int, amount: int, event_key: str, message: str):
-    today = today_ist()
+def award_xp(user_id: int, amount: int, event_key: str, message: str, *, event_date=None):
+    today = event_date or today_ist()
     conn = get_db()
     with conn.cursor() as cursor:
         try:
@@ -1252,7 +1330,8 @@ def award_xp(user_id: int, amount: int, event_key: str, message: str):
         cursor.execute("SELECT COALESCE(xp, 0) AS xp FROM users WHERE id = %s", (user_id,))
         xp = cursor.fetchone()["xp"]
     create_notification(user_id, "xp", message)
-    award_badges(user_id)
+    if not event_key.startswith("daily_quest"):
+        award_badges(user_id)
     return {"awarded": True, "xp": xp}
 
 
@@ -2243,15 +2322,19 @@ def api_update_profile_banner():
 
 @app.post("/api/quests/daily-curiosity")
 @api_login_required
+@atomic
 def api_claim_daily_curiosity():
     payload = request.get_json(silent=True) or {}
     quest = current_daily_quest()
-    if payload.get("quest_key") and payload.get("quest_key") != quest["key"]:
-        return jsonify({"awarded": False, "error": "That quest is not active today."}), 400
-    progress = int(payload.get("progress") or 0)
-    if quest["kind"] == "mentor_views":
-        mentor_ids = {int(mid) for mid in payload.get("mentor_ids", []) if str(mid).isdigit()}
-        progress = len(mentor_ids)
+    if not isinstance(payload, dict) or payload.get("quest_key") != quest["key"] or payload.get("quest_date") != quest["date"]:
+        return jsonify({"awarded": False, "error": "The daily quest has changed. Refresh to see today's quest."}), 409
+    user_id = session["user_id"]
+    with get_db().cursor() as cursor:
+        cursor.execute("SELECT id FROM users WHERE id = %s FOR UPDATE", (user_id,))
+    if has_daily_quest_claim(user_id, quest):
+        return jsonify({"awarded": False, "dailyQuest": quest, "dailyQuestClaimed": True,
+                        "user": current_user(), "message": "Daily quest already completed today."})
+    progress = daily_quest_progress(user_id, quest, payload.get("mentor_ids", []))
     if progress < int(quest["target"]):
         return jsonify({"awarded": False, "error": "Finish today’s quest first."}), 400
     result = award_xp(
@@ -2259,6 +2342,7 @@ def api_claim_daily_curiosity():
         int(quest["xp"]),
         quest["event_key"],
         f"Daily quest complete: +{quest['xp']} XP for {quest['title']}.",
+        event_date=quest["date"],
     )
     return jsonify({
         **result,
@@ -2272,33 +2356,7 @@ def api_claim_daily_curiosity():
 @app.post("/api/quests/daily-reset")
 @api_login_required
 def api_reset_daily_quest():
-    quest = current_daily_quest()
-    user_id = session["user_id"]
-    amount = int(quest.get("xp") or 0)
-    reset = False
-    ensure_xp_system()
-    with get_db().cursor() as cursor:
-        cursor.execute(
-            "DELETE FROM xp_events WHERE user_id = %s AND event_key = %s AND event_date IN (%s, %s)",
-            (user_id, quest["event_key"], today_ist(), datetime.utcnow().date()),
-        )
-        reset = cursor.rowcount > 0
-        if reset and amount:
-            cursor.execute(
-                "UPDATE users SET xp = GREATEST(COALESCE(xp, 0) - %s, 0) WHERE id = %s",
-                (amount, user_id),
-            )
-            cursor.execute(
-                "DELETE FROM notifications WHERE user_id = %s AND type = 'xp' AND message LIKE %s",
-                (user_id, f"Daily quest complete:%{quest['title']}%"),
-            )
-    return jsonify({
-        "reset": reset,
-        "dailyQuest": quest,
-        "dailyQuestClaimed": False,
-        "user": current_user(),
-        "message": "Daily quest reset. Try it again." if reset else "Daily quest was already fresh.",
-    })
+    return jsonify({"error": "Daily quests reset automatically at midnight IST."}), 403
 
 
 @app.post("/api/credits/purchase")

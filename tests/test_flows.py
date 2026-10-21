@@ -261,6 +261,107 @@ class Flows(unittest.TestCase):
         self.assertEqual(results,[200]*8)
         self.assertEqual(self.sql('SELECT balance FROM credits WHERE user_id=%s',(self.learner,))[0]['balance'],15)
 
+    def quest(self, key):
+        quest = dict(next(q for q in backend.DAILY_QUESTS if q['key'] == key))
+        quest.update(date=backend.today_ist().isoformat(), event_key='daily_quest_' + key)
+        quest['resets_at'] = f"{backend.today_ist() + timedelta(days=1)}T00:00:00+05:30"
+        return quest
+
+    def claim_quest(self, quest, uid=None, **extra):
+        return self.request(uid or self.learner, '/api/quests/daily-curiosity',
+                            {'quest_key': quest['key'], 'quest_date': quest['date'], **extra})
+
+    def test_daily_quest_xp_only_and_retries_award_once(self):
+        quest = self.quest('mentor_spotlight')
+        with patch.object(backend, 'current_daily_quest', return_value=quest):
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                responses = list(pool.map(lambda _: self.claim_quest(quest, mentor_ids=[self.mentor]), range(8)))
+            self.assertEqual([r.status_code for r in responses], [200] * 8)
+            self.assertEqual(sum(r.json['awarded'] for r in responses), 1)
+            data = self.request(self.learner, '/api/app', method='GET').json
+            self.assertTrue(data['dailyQuestClaimed'])
+            self.assertEqual(data['dailyQuestProgress'], 1)
+            self.assertEqual(data['user']['xp'], 50)
+            self.assertEqual(data['user']['badge_xp'], 0)
+            self.assertEqual(data['badges'], [])
+        with backend.app.test_request_context():
+            backend.award_badges(self.learner)  # Future activity must not turn bonus XP into a badge.
+        self.assertEqual(self.sql('SELECT COUNT(*) n FROM user_badges WHERE user_id=%s', (self.learner,))[0]['n'], 0)
+        self.assertEqual(self.sql('SELECT balance FROM credits WHERE user_id=%s', (self.learner,))[0]['balance'], 10)
+
+    def test_daily_quest_rejects_stale_or_invalid_claims(self):
+        quest = self.quest('mentor_explorer')
+        with patch.object(backend, 'current_daily_quest', return_value=quest):
+            for ids in ([self.mentor, self.mentor], [self.learner, self.mentor], [99999999, self.mentor], ['²', '9' * 5000], 'bad'):
+                self.assertEqual(self.claim_quest(quest, mentor_ids=ids, progress=999).status_code, 400)
+            self.assertEqual(self.claim_quest(quest, quest_date='2000-01-01').status_code, 409)
+            self.assertEqual(self.claim_quest(quest, quest_key='wrong').status_code, 409)
+            self.assertEqual(self.request(self.learner, '/api/quests/daily-reset').status_code, 403)
+
+    def test_booking_quest_uses_today_not_client_count_or_session_date(self):
+        quest = self.quest('book_two')
+        self.session('cancelled')
+        old = self.session()
+        self.sql('UPDATE sessions SET created_at=%s WHERE id=%s', (backend.app_now()-timedelta(days=2), old))
+        with patch.object(backend, 'current_daily_quest', return_value=quest):
+            self.assertEqual(self.claim_quest(quest, progress=999).status_code, 400)
+            self.session('pending')
+            data = self.request(self.learner, '/api/app', method='GET').json
+            self.assertEqual(data['dailyQuestProgress'], 1)
+            self.assertEqual(self.claim_quest(quest, progress=999).status_code, 400)
+            self.session('scheduled')  # Future scheduled date; created today.
+            self.assertTrue(self.claim_quest(quest).json['awarded'])
+            self.assertEqual(self.claim_quest(quest, uid=self.mentor, progress=999).status_code, 400)
+
+    def test_completion_quest_requires_confirmed_sessions_today_for_either_side(self):
+        quest = self.quest('complete_two')
+        self.session('scheduled', joined=True)  # Merely opening a meeting is not completion.
+        with patch.object(backend, 'current_daily_quest', return_value=quest):
+            self.assertEqual(self.claim_quest(quest, progress=999).status_code, 400)
+            for index in range(2):
+                sid = self.session('awaiting_confirmation', joined=True)
+                self.assertEqual(self.request(self.learner, f'/api/sessions/{sid}/confirm').status_code, 200)
+                data = self.request(self.learner, '/api/app', method='GET').json
+                self.assertEqual(data['dailyQuestProgress'], index + 1)
+                if index == 0:
+                    self.assertEqual(self.claim_quest(quest).status_code, 400)
+            for uid in (self.learner, self.mentor):
+                result = self.claim_quest(quest, uid=uid)
+                self.assertEqual(result.status_code, 200)
+                self.assertTrue(result.json['awarded'])
+        with backend.app.app_context():
+            self.assertEqual(backend.daily_quest_progress(self.learner, quest), 2)
+        self.sql('UPDATE transactions SET created_at=%s WHERE user_id IN (%s,%s)',
+                 (backend.app_now()-timedelta(days=1), self.learner, self.mentor))
+        with backend.app.app_context():
+            self.assertEqual(backend.daily_quest_progress(self.learner, quest), 0)
+
+    def test_quest_next_day_fresh_and_legacy_same_day_claim_respected(self):
+        quest = self.quest('mentor_spotlight')
+        self.sql("INSERT INTO xp_events(user_id,event_key,amount,event_date) VALUES (%s,'daily_quest_old',50,%s)",
+                 (self.learner, backend.today_ist()))
+        with patch.object(backend, 'current_daily_quest', return_value=quest):
+            self.assertFalse(self.claim_quest(quest, mentor_ids=[self.mentor]).json['awarded'])
+            self.sql('UPDATE xp_events SET event_date=%s WHERE user_id=%s',
+                     (backend.today_ist()-timedelta(days=1), self.learner))
+            self.assertFalse(self.request(self.learner, '/api/app', method='GET').json['dailyQuestClaimed'])
+            self.assertTrue(self.claim_quest(quest, mentor_ids=[self.mentor]).json['awarded'])
+
+    def test_quest_notification_failure_rolls_back_xp_and_claim(self):
+        quest = self.quest('mentor_spotlight')
+        with patch.object(backend, 'current_daily_quest', return_value=quest):
+            with patch.object(backend, 'create_notification', side_effect=RuntimeError('test rollback')):
+                with self.assertRaises(RuntimeError):
+                    self.claim_quest(quest, mentor_ids=[self.mentor])
+            self.assertTrue(self.claim_quest(quest, mentor_ids=[self.mentor]).json['awarded'])
+        self.assertEqual(self.sql('SELECT xp FROM users WHERE id=%s', (self.learner,))[0]['xp'], 50)
+
+    def test_non_quest_xp_still_unlocks_normal_badges(self):
+        with backend.app.test_request_context():
+            backend.award_xp(self.learner, 50, 'test_regular_xp', 'Regular XP')
+        badges = self.sql('SELECT b.name FROM user_badges ub JOIN badges b ON b.id=ub.badge_id WHERE ub.user_id=%s', (self.learner,))
+        self.assertIn('Curiosity Spark', [b['name'] for b in badges])
+
     def test_due_reminder_delivered_once(self):
         sid=self.session()
         self.sql("INSERT INTO session_reminders(session_id,user_id,reminder_key,scheduled_at,message) VALUES (%s,%s,'test',%s,'Audit reminder')",(sid,self.learner,backend.app_now()-timedelta(minutes=1)))
