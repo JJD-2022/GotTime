@@ -1059,6 +1059,11 @@ input:focus, textarea:focus, select:focus { border-color: #7aa465; box-shadow: 0
 .form-notice { margin: -5px 0 14px; padding: 10px 12px; color: #315244; background: #eaf8f1; border: 1px solid #c9e5d8; border-radius: 10px; font-size: 12px; }
 .guardian-warning { display: flex; align-items: flex-start; gap: 10px; margin: -2px 0 14px; padding: 12px 13px; color: var(--green); background: color-mix(in srgb, var(--lime) 30%, var(--surface)); border: 1px solid color-mix(in srgb, var(--green) 22%, var(--line)); border-radius: 12px; font-size: 12px; line-height: 1.45; }
 .guardian-warning svg { flex: 0 0 auto; margin-top: 1px; color: var(--green); }
+.booking-availability { display: flex; align-items: flex-start; gap: 10px; padding: 12px 13px; border: 1px solid var(--line); border-radius: 12px; font-size: 13px; line-height: 1.5; color: var(--green); }
+.booking-availability svg { flex-shrink: 0; margin-top: 2px; }
+.booking-availability.conflict { color: #a63232; background: #fff0ed; border-color: #e6b0a8; }
+[data-theme="dark"] .booking-availability.conflict { color: #ffc0b7; background: #462725; border-color: #98605a; }
+.booking-availability .text-button { display: block; color: inherit; margin-top: 6px; }
 .guardian-confirm { display: flex; align-items: flex-start; gap: 10px; margin: -4px 0 14px; padding: 12px 13px; color: var(--ink); background: var(--surface-2); border: 1px solid var(--line); border-radius: 14px; font-size: 12px; font-weight: 800; line-height: 1.45; }
 .guardian-confirm input { width: 17px; height: 17px; flex: 0 0 auto; margin: 1px 0 0; accent-color: var(--green); }
 .booking-preferred-time {

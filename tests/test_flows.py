@@ -93,6 +93,89 @@ class Flows(unittest.TestCase):
         self.assertEqual(results.count(201),1,results)
         self.assertEqual(results.count(409),7,results)
 
+    def availability(self, when=None, uid=None, **extra):
+        return self.request(uid or self.learner, '/api/sessions/availability', {
+            'mentorId': self.mentor, 'skillId': self.skill,
+            'scheduledFor': (when or self.time).isoformat(), **extra})
+
+    def test_live_clash_preview_and_back_to_back_bookings(self):
+        sid = self.session('pending')
+        for minutes in [-59, 0, 30, 59]:
+            result = self.availability(self.time + timedelta(minutes=minutes))
+            self.assertEqual(result.status_code, 200)
+            self.assertFalse(result.json['available'])
+            self.assertIn('You already have Python', result.json['message'])
+            self.assertIn(self.time.strftime('%d %b %Y'), result.json['message'])
+            self.assertIn('06:00 PM', result.json['message'])
+            self.assertIn('07:00 PM', result.json['message'])
+        for minutes in [-60, 60]:
+            self.assertTrue(self.availability(self.time + timedelta(minutes=minutes)).json['available'])
+        self.assertEqual(self.booking(when=self.time + timedelta(minutes=30)).status_code, 409)
+        self.assertEqual(self.booking(when=self.time + timedelta(minutes=60)).status_code, 201)
+        self.assertEqual(self.sql('SELECT status FROM sessions WHERE id=%s', (sid,))[0]['status'], 'pending')
+
+    def test_clashes_cover_both_roles_and_hide_other_users_details(self):
+        self.session()
+        other = self.user()
+        result = self.availability(uid=other)
+        self.assertFalse(result.json['available'])
+        self.assertEqual(result.json['message'], 'The mentor already has a session during that time. Choose another time.')
+        # Our learner is teaching another session, even though the selected mentor is free.
+        self.sql('UPDATE sessions SET mentor_id=%s, learner_id=%s WHERE mentor_id=%s', (self.learner, other, self.mentor))
+        self.assertIn('You already have', self.availability().json['message'])
+        self.assertEqual(self.booking().status_code, 409)
+
+    def test_live_clash_statuses_and_cross_midnight_duration(self):
+        self.sql('UPDATE user_skills SET duration=120 WHERE user_id=%s', (self.mentor,))
+        start = self.time.replace(hour=23, minute=30)
+        sid = self.session(when=start)
+        for status in ['pending', 'accepted', 'scheduled', 'awaiting_confirmation']:
+            self.sql('UPDATE sessions SET status=%s WHERE id=%s', (status, sid))
+            self.assertFalse(self.availability(start + timedelta(minutes=90)).json['available'])
+            self.assertTrue(self.availability(start + timedelta(minutes=120)).json['available'])
+        for status in ['cancelled', 'completed', 'missed']:
+            self.sql('UPDATE sessions SET status=%s WHERE id=%s', (status, sid))
+            self.assertTrue(self.availability(start).json['available'])
+
+    def test_preview_uses_requested_duration_and_rechecks_on_booking(self):
+        self.sql('UPDATE user_skills SET duration=120 WHERE user_id=%s', (self.mentor,))
+        self.assertTrue(self.availability().json['available'])
+        self.session(when=self.time + timedelta(minutes=90))
+        self.assertFalse(self.availability().json['available'])
+        self.assertEqual(self.booking().status_code, 409)
+
+    def test_rescheduling_and_chat_use_actual_skill_duration(self):
+        self.sql('UPDATE user_skills SET duration=120 WHERE user_id=%s', (self.mentor,))
+        sid = self.session(when=self.time + timedelta(days=1))
+        other = self.user()
+        self.sql('INSERT INTO sessions(learner_id,mentor_id,skill_id,status,scheduled_for) VALUES (%s,%s,%s,%s,%s)',
+                 (other, self.mentor, self.skill, 'scheduled', self.time + timedelta(minutes=90)))
+        body = {'scheduledFor': self.time.isoformat()}
+        self.assertEqual(self.request(self.mentor, f'/api/sessions/{sid}/schedule', body).status_code, 409)
+        self.assertEqual(self.request(self.mentor, f'/api/messages/{self.learner}/schedule', body).status_code, 409)
+        self.assertEqual(self.request(self.mentor, f'/api/messages/{self.user()}/schedule', body).status_code, 409)
+        # The session itself must not prevent a no-op reschedule.
+        self.assertEqual(self.request(self.mentor, f'/api/sessions/{sid}/schedule', {'scheduledFor': (self.time + timedelta(days=1)).isoformat()}).status_code, 200)
+
+    def test_availability_validates_inputs_and_does_not_create_bookings(self):
+        for extra in [{'mentorId': 'invalid'}, {'skillId': -1}, {'scheduledFor': 'invalid'},
+                      {'scheduledFor': backend.app_now().isoformat()}, {'mentorId': self.learner}]:
+            self.assertEqual(self.availability(**extra).status_code, 400)
+        self.assertTrue(self.availability().json['available'])
+        self.assertEqual(self.sql('SELECT COUNT(*) n FROM sessions WHERE learner_id=%s', (self.learner,))[0]['n'], 0)
+        with backend.app.test_client() as client:
+            self.assertEqual(client.post('/api/sessions/availability', json={}).status_code, 401)
+
+    def test_legacy_booking_cannot_bypass_clash_check(self):
+        self.session()
+        with backend.app.test_client() as client:
+            with client.session_transaction() as state:
+                state['user_id'] = self.learner
+            result = client.post('/sessions', data={'mentor_id': self.mentor, 'skill_id': self.skill,
+                                                    'scheduled_for': self.time.isoformat(), 'mode': 'online'})
+            self.assertEqual(result.status_code, 410)  # Retired form routes stay disabled.
+        self.assertEqual(self.sql('SELECT COUNT(*) n FROM sessions WHERE learner_id=%s', (self.learner,))[0]['n'], 1)
+
     def test_credit_commitments_and_range(self):
         self.sql('UPDATE credits SET balance=1 WHERE user_id=%s',(self.learner,))
         self.assertEqual(self.booking().status_code,201)

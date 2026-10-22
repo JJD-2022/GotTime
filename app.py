@@ -415,6 +415,32 @@ def lock_participants(cursor, learner_id, mentor_id):
     return cursor.fetchall()
 
 
+def session_overlap(cursor, learner_id, mentor_id, scheduled_at, duration=60, exclude_id=0):
+    cursor.execute("""SELECT s.id, s.learner_id, s.mentor_id, s.scheduled_for,
+        COALESCE(us.duration,60) AS duration, sk.name AS skill_name FROM sessions s
+        LEFT JOIN user_skills us ON us.user_id = s.mentor_id AND us.skill_id = s.skill_id
+        LEFT JOIN skills sk ON sk.id = s.skill_id
+        WHERE (s.learner_id IN (%s,%s) OR s.mentor_id IN (%s,%s))
+        AND s.status IN ('pending','accepted','scheduled','awaiting_confirmation') AND s.id != %s
+        AND s.scheduled_for < %s
+        AND DATE_ADD(s.scheduled_for, INTERVAL COALESCE(us.duration,60) MINUTE) > %s
+        ORDER BY (s.learner_id = %s OR s.mentor_id = %s) DESC, s.scheduled_for, s.id LIMIT 1""",
+        (learner_id, mentor_id, learner_id, mentor_id, exclude_id,
+         scheduled_at + timedelta(minutes=int(duration or 60)), scheduled_at, learner_id, learner_id))
+    return cursor.fetchone()
+
+
+def overlap_message(conflict, user_id, other_role="mentor"):
+    # Only describe sessions the current user participates in.
+    if user_id in (conflict["learner_id"], conflict["mentor_id"]):
+        start = conflict["scheduled_for"]
+        end = start + timedelta(minutes=int(conflict["duration"] or 60))
+        return (f"You already have {conflict['skill_name'] or 'a session'} on "
+                f"{start:%d %b %Y, %I:%M %p} to {end:%d %b %Y, %I:%M %p} (IST). "
+                "Choose a time outside this session.")
+    return f"The {other_role} already has a session during that time. Choose another time."
+
+
 def booking_problem(cursor, learner_id, mentor_id, scheduled_at, duration=60, exclude_id=0):
     if int(learner_id) == int(mentor_id):
         return "You cannot book yourself."
@@ -427,16 +453,9 @@ def booking_problem(cursor, learner_id, mentor_id, scheduled_at, duration=60, ex
         AND status IN ('pending','accepted','scheduled','awaiting_confirmation') AND id != %s""", (learner_id, exclude_id))
     if balance <= cursor.fetchone()["n"]:
         return "You need an available credit; your remaining credits are committed to other sessions."
-    cursor.execute("""SELECT s.id FROM sessions s
-        LEFT JOIN user_skills us ON us.user_id = s.mentor_id AND us.skill_id = s.skill_id
-        WHERE (s.learner_id IN (%s,%s) OR s.mentor_id IN (%s,%s))
-        AND s.status IN ('pending','accepted','scheduled','awaiting_confirmation') AND s.id != %s
-        AND s.scheduled_for < %s
-        AND DATE_ADD(s.scheduled_for, INTERVAL COALESCE(us.duration,60) MINUTE) > %s LIMIT 1""",
-        (learner_id, mentor_id, learner_id, mentor_id, exclude_id,
-         scheduled_at + timedelta(minutes=int(duration or 60)), scheduled_at))
-    if cursor.fetchone():
-        return "One of you already has a session during that time. Choose another time."
+    conflict = session_overlap(cursor, learner_id, mentor_id, scheduled_at, duration, exclude_id)
+    if conflict:
+        return overlap_message(conflict, session["user_id"], "mentor" if session["user_id"] == learner_id else "learner")
     return None
 
 
@@ -2925,6 +2944,34 @@ def api_remove_skill(skill_id):
         return jsonify({"error": "Could not remove skill right now."}), 500
 
 
+@app.post("/api/sessions/availability")
+@api_login_required
+def api_session_availability():
+    """Read-only preview. The booking transaction still rechecks under locks."""
+    payload = request.get_json(silent=True) or {}
+    try:
+        mentor_id = int(payload.get("mentorId"))
+        skill_id = int(payload.get("skillId"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Choose a valid mentor and skill."}), 400
+    scheduled_at = parse_session_datetime(payload.get("scheduledFor"))
+    if not scheduled_at or scheduled_at <= app_now():
+        return jsonify({"error": "Choose a future date and time."}), 400
+    if mentor_id == session["user_id"]:
+        return jsonify({"error": "You cannot book yourself."}), 400
+    with get_db().cursor() as cursor:
+        cursor.execute("""SELECT us.duration FROM user_skills us
+            JOIN users u ON u.id = us.user_id AND u.is_active = 1
+            WHERE us.user_id = %s AND us.skill_id = %s ORDER BY us.id DESC LIMIT 1""",
+            (mentor_id, skill_id))
+        skill = cursor.fetchone()
+        if not skill:
+            return jsonify({"error": "Choose a valid mentor skill."}), 400
+        conflict = session_overlap(cursor, session["user_id"], mentor_id, scheduled_at, skill["duration"])
+    return jsonify({"available": conflict is None,
+                    "message": overlap_message(conflict, session["user_id"]) if conflict else ""})
+
+
 @app.post("/api/sessions")
 @api_login_required
 @atomic
@@ -3002,7 +3049,7 @@ def api_schedule_session_time(session_id):
         return jsonify({"error": "Choose a future date and time."}), 400
     with get_db().cursor() as cursor:
         cursor.execute(
-            """SELECT s.*, sk.name AS skill_name, us.preferred_time AS preferred_time,
+            """SELECT s.*, sk.name AS skill_name, us.preferred_time AS preferred_time, COALESCE(us.duration,60) AS duration,
                       mentor.username AS mentor_name, learner.username AS learner_name
                FROM sessions s
                JOIN skills sk ON sk.id = s.skill_id
@@ -3022,7 +3069,7 @@ def api_schedule_session_time(session_id):
             return jsonify({"error": "This session can no longer be rescheduled."}), 400
         if not str(item.get("notes") or "").startswith("Scheduled from chat") and not is_time_inside_preferred_range(scheduled_at, item.get("preferred_time")):
             return jsonify({"error": "Choose a time inside your available range for this skill."}), 400
-        problem = booking_problem(cursor, item["learner_id"], item["mentor_id"], scheduled_at, exclude_id=session_id)
+        problem = booking_problem(cursor, item["learner_id"], item["mentor_id"], scheduled_at, item["duration"], exclude_id=session_id)
         if problem:
             return jsonify({"error": problem}), 409
         cursor.execute(
@@ -3057,7 +3104,7 @@ def api_schedule_session_from_chat(contact_id):
         if not cursor.fetchone():
             return jsonify({"error": "That learner account was not found."}), 404
         cursor.execute(
-            """SELECT us.skill_id, sk.name AS skill_name, us.preferred_time AS preferred_time
+            """SELECT us.skill_id, sk.name AS skill_name, us.preferred_time AS preferred_time, COALESCE(us.duration,60) AS duration
                FROM user_skills us JOIN skills sk ON sk.id = us.skill_id
                WHERE us.user_id = %s
                ORDER BY us.created_at DESC LIMIT 1""",
@@ -3067,7 +3114,7 @@ def api_schedule_session_from_chat(contact_id):
         if not skill:
             return jsonify({"error": "Add a skill first, then you can schedule learners from chat."}), 400
         cursor.execute(
-            """SELECT s.*, sk.name AS skill_name, us.preferred_time AS preferred_time,
+            """SELECT s.*, sk.name AS skill_name, us.preferred_time AS preferred_time, COALESCE(us.duration,60) AS duration,
                       mentor.username AS mentor_name, learner.username AS learner_name
                FROM sessions s
                JOIN skills sk ON sk.id = s.skill_id
@@ -3081,7 +3128,8 @@ def api_schedule_session_from_chat(contact_id):
             (mentor_id, learner_id),
         )
         item = cursor.fetchone()
-        problem = booking_problem(cursor, learner_id, mentor_id, scheduled_at, exclude_id=item["id"] if item else 0)
+        problem = booking_problem(cursor, learner_id, mentor_id, scheduled_at,
+                                  item["duration"] if item else skill["duration"], exclude_id=item["id"] if item else 0)
         if problem:
             return jsonify({"error": problem}), 409
         if item:
