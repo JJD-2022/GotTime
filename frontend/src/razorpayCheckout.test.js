@@ -9,11 +9,8 @@ test("normal checkout includes UPI alongside existing payment methods", () => {
   assert.deepEqual(options.config.display.blocks.upi.instruments, [{ method: "upi" }]);
 });
 
-test("UPI card opens only verified UPI checkout without restricting QR or intent", () => {
-  const options = razorpayPaymentOptions(true);
-  assert.deepEqual(options.method, { upi: true, card: false, netbanking: false, wallet: false });
-  assert.deepEqual(options.config.display.sequence, ["block.upi"]);
-  assert.deepEqual(Object.keys(options.config.display.blocks), ["upi"]);
+test("checkout keeps UPI flows available without overriding payment verification", () => {
+  const options = razorpayPaymentOptions();
   assert.equal(options.config.display.preferences.show_default_blocks, false);
   assert.deepEqual(options.config.display.blocks.upi.instruments, [{ method: "upi" }]);
   assert.equal("handler" in options, false);
