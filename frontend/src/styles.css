@@ -1779,7 +1779,9 @@ input:focus, textarea:focus, select:focus { border-color: #7aa465; box-shadow: 0
 .mentor-detail-grid .mentor-detail-actions .soft-button { min-height: 38px; padding-inline: 13px; font-size: 13px; }
 .mentor-list-view { max-width: 760px; display: flex; flex-direction: column; gap: 10px; }
 .mentor-list-view .mentor-detail-card { max-width: none; min-height: 112px; display: grid; grid-template-columns: 138px minmax(0, 1fr); align-items: stretch; }
-.mentor-list-view .mentor-cover { height: 100%; min-height: 112px; }
+.mentor-list-view .mentor-cover { min-height: 112px; }
+/* List banners fill their column; fixed grid-card heights must not override them. */
+.mentor-list-view .mentor-detail-card > .mentor-cover { height: auto; align-self: stretch; }
 .mentor-list-view .mentor-cover > span { font-size: 24px; }
 .mentor-list-view .mentor-detail-body { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 14px; padding: 14px 16px; }
 .mentor-list-view .mentor-detail-body .mentor-name { margin-top: 0; }
