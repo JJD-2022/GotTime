@@ -125,6 +125,84 @@ class Flows(unittest.TestCase):
             self.assertEqual(self.request(self.mentor,f'/api/sessions/{sid}/accept').status_code,409)
             self.assertEqual(self.request(self.mentor,f'/api/sessions/{sid}/schedule',{'scheduledFor':self.time.isoformat()}).status_code,400)
 
+    def test_first_teaching_badge_requires_completed_mentor_session_and_awards_once(self):
+        sid = self.session('awaiting_confirmation', joined=True)
+        with backend.app.app_context():
+            self.assertNotIn('First Session Taught', backend.award_badges(self.mentor))
+        result = self.request(self.learner,f'/api/sessions/{sid}/confirm')
+        self.assertEqual(result.status_code,200,result.json)
+        for _ in range(2):
+            mentor_badges = self.request(self.mentor,'/api/app',method='GET').json['badges']
+            self.assertEqual(len([b for b in mentor_badges if b['name']=='First Session Taught']),1)
+            self.assertNotIn('10 Hours Taught',[b['name'] for b in mentor_badges])
+            learner_badges = self.request(self.learner,'/api/app',method='GET').json['badges']
+            self.assertNotIn('First Session Taught',[b['name'] for b in learner_badges])
+            with backend.app.app_context():
+                self.assertNotIn('First Session Taught',backend.award_badges(self.mentor))
+        self.assertEqual(self.sql("SELECT COUNT(*) n FROM notifications WHERE user_id=%s AND message='You unlocked the First Session Taught badge.'",(self.mentor,))[0]['n'],1)
+
+    def test_existing_teaching_badge_keeps_identity_and_earned_date(self):
+        badge_id = self.sql("SELECT id FROM badges WHERE name='10 Hours Taught'")[0]['id']
+        earned_at = '2026-09-01 12:00:00'
+        self.sql('INSERT INTO user_badges(user_id,badge_id,earned_at) VALUES (%s,%s,%s)',(self.mentor,badge_id,earned_at))
+        response = self.request(self.mentor,'/api/app',method='GET')
+        self.assertEqual(response.status_code,200,response.json)
+        badge = next(b for b in response.json['badges'] if b['id']==badge_id)
+        self.assertEqual(badge['name'],'First Session Taught')
+        self.assertEqual(badge['description'],'Completed your first session as a mentor.')
+        rows = self.sql('SELECT badge_id,earned_at FROM user_badges WHERE user_id=%s',(self.mentor,))
+        self.assertEqual(len(rows),1)
+        self.assertEqual(str(rows[0]['earned_at']),earned_at)
+
+    def test_acceptance_lists_both_chat_partners_without_messages(self):
+        sid = self.session('pending')
+        def contacts(uid):
+            response = self.request(uid,'/api/app',method='GET')
+            self.assertEqual(response.status_code,200,response.json)
+            return response.json['contacts']
+        self.assertNotIn(self.learner,[c['id'] for c in contacts(self.mentor)])
+        self.assertNotIn(self.mentor,[c['id'] for c in contacts(self.learner)])
+        result = self.request(self.mentor,f'/api/sessions/{sid}/accept')
+        self.assertEqual(result.status_code,200,result.json)
+        for uid, other in ((self.mentor,self.learner),(self.learner,self.mentor)):
+            found = [c for c in contacts(uid) if c['id'] == other]
+            self.assertEqual(len(found),1)
+            self.assertTrue(found[0]['username'])
+            self.assertIsNone(found[0]['last_message'])
+            self.assertEqual(found[0]['unread_count'],0)
+            self.assertEqual(self.request(uid,f'/api/messages/{other}',method='GET').json['messages'],[])
+        outsider = self.user()
+        self.assertEqual(contacts(outsider),[])
+        # Older accepted sessions are included automatically; multiple sessions do not duplicate contacts.
+        self.session('scheduled',when=self.time+timedelta(days=1))
+        self.assertEqual([c['id'] for c in contacts(self.mentor)].count(self.learner),1)
+        self.sql("UPDATE sessions SET status='completed' WHERE id=%s",(sid,))
+        self.assertIn(self.learner,[c['id'] for c in contacts(self.mentor)])
+
+    def test_accepted_mentor_can_start_encrypted_chat_and_learner_reply(self):
+        self.session('accepted')
+        for sender, receiver, message in ((self.mentor,self.learner,'Meeting link: https://meet.google.com/abc-defg-hij'),
+                                          (self.learner,self.mentor,'Thanks, see you there!')):
+            # Encryption itself is exercised by chatCrypto.test.js; the API stores an envelope unchanged.
+            envelope = {'audit':message}
+            result = self.request(sender,f'/api/messages/{receiver}',{'content':message,'encryptedContent':envelope})
+            self.assertEqual(result.status_code,201,result.json)
+            # Messages sent in the same second must still preserve send order.
+            self.sql("UPDATE messages SET created_at='2026-10-01 12:00:00' WHERE (sender_id=%s AND receiver_id=%s) OR (sender_id=%s AND receiver_id=%s)",
+                     (self.mentor,self.learner,self.learner,self.mentor))
+            thread = self.request(receiver,f'/api/messages/{sender}',method='GET').json['messages']
+            self.assertEqual(thread[-1]['sender_id'],sender)
+            self.assertEqual(json.loads(thread[-1]['encrypted_content']),envelope)
+        self.assertEqual(len(thread),2)
+
+    def test_pending_declined_and_inactive_users_are_not_new_chat_contacts(self):
+        sid = self.session('pending')
+        self.assertEqual(self.request(self.mentor,f'/api/sessions/{sid}/decline').status_code,200)
+        self.assertEqual(self.request(self.mentor,'/api/app',method='GET').json['contacts'],[])
+        self.session('accepted')
+        self.sql('UPDATE users SET is_active=0 WHERE id=%s',(self.learner,))
+        self.assertEqual(self.request(self.mentor,'/api/app',method='GET').json['contacts'],[])
+
     def test_missed_sessions_deduct_once_and_preserve_attendance(self):
         sid=self.session(when=backend.app_now()-timedelta(hours=2))
         attended=self.session(joined=True,when=backend.app_now()-timedelta(hours=2))
@@ -370,6 +448,25 @@ class Flows(unittest.TestCase):
         payment, body = self.payment_fixture()
         with patch.dict(backend.app.config, RAZORPAY_KEY_ID='rzp_live_audit', RAZORPAY_WEBHOOK_SECRET=''):
             self.assertEqual(self.request(self.learner,'/api/credits/verify',body).status_code,200)
+
+    def test_checkout_order_errors_are_safe_and_missing_signature_is_bad_request(self):
+        payment, body = self.payment_fixture()
+        for path, payload in (('/api/credits/purchase', {'packageId':'starter'}),
+                              ('/api/donations/create', {'amount':10})):
+            for upstream, expected in ((401,401),(400,500),(503,500)):
+                response = Mock(status_code=upstream)
+                response.json.side_effect = ValueError('provider returned non-JSON')
+                with patch.object(backend.requests,'post',return_value=response):
+                    r = self.request(self.learner,path,payload)
+                    self.assertEqual(r.status_code,expected,r.json)
+                    response.json.assert_not_called()
+            with patch.object(backend.requests,'post',side_effect=backend.requests.Timeout()):
+                self.assertEqual(self.request(self.learner,path,payload).status_code,500)
+        body.pop('razorpay_signature')
+        for path in ('/api/credits/verify','/api/donations/verify'):
+            self.assertEqual(self.request(self.learner,path,body).status_code,400)
+        self.payment_lookup.assert_not_called()
+        self.assertEqual(self.sql('SELECT balance FROM credits WHERE user_id=%s',(self.learner,))[0]['balance'],10)
 
     def quest(self, key):
         quest = dict(next(q for q in backend.DAILY_QUESTS if q['key'] == key))

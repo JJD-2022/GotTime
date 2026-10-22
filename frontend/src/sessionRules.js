@@ -4,6 +4,13 @@ export function guardianNotice(user, mode) {
   return Number(user.age) < limit ? `Because you are under ${limit}, your parent or guardian must be present during this ${mode} session.` : "";
 }
 
+export function sessionChatContact(item, userId) {
+  if (!["accepted", "scheduled", "awaiting_confirmation", "completed", "missed"].includes(item.status)) return null;
+  if (item.mentor_id === userId) return item.learner_id;
+  if (item.learner_id === userId) return item.mentor_id;
+  return null;
+}
+
 export function meetingUrl(raw) {
   try {
     const input = String(raw || "").trim();

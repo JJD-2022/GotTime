@@ -262,7 +262,7 @@ def minimal_app_payload(error: str = ""):
                            WHERE ((m.sender_id = %s AND m.receiver_id = u.id AND m.deleted_for_sender = 0)
                               OR (m.sender_id = u.id AND m.receiver_id = %s AND m.deleted_for_receiver = 0))
                              AND m.deleted_for_everyone = 0
-                           ORDER BY m.created_at DESC LIMIT 1) AS last_message,
+                           ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS last_message,
                           (SELECT COUNT(*) FROM messages unread
                            WHERE unread.sender_id = u.id
                              AND unread.receiver_id = %s
@@ -272,14 +272,22 @@ def minimal_app_payload(error: str = ""):
                    FROM users u
                    WHERE u.id != %s
                      AND u.is_active = 1
-                     AND EXISTS (
+                     AND (EXISTS (
                        SELECT 1 FROM messages existing
                        WHERE ((existing.sender_id = %s AND existing.receiver_id = u.id AND existing.deleted_for_sender = 0)
                           OR (existing.sender_id = u.id AND existing.receiver_id = %s AND existing.deleted_for_receiver = 0))
                          AND existing.deleted_for_everyone = 0
-                     )
+                     ) OR EXISTS (
+                       SELECT 1 FROM sessions booked
+                       WHERE booked.mentor_id = %s AND booked.learner_id = u.id
+                         AND booked.status IN ('accepted', 'scheduled', 'awaiting_confirmation', 'completed', 'missed')
+                     ) OR EXISTS (
+                       SELECT 1 FROM sessions booked
+                       WHERE booked.learner_id = %s AND booked.mentor_id = u.id
+                         AND booked.status IN ('accepted', 'scheduled', 'awaiting_confirmation', 'completed', 'missed')
+                     ))
                    ORDER BY u.username""",
-                (user_id, user_id, user_id, user_id, user_id, user_id),
+                (user_id, user_id, user_id, user_id, user_id, user_id, user_id, user_id),
             )
             contacts = cursor.fetchall()
             cursor.execute(
@@ -313,7 +321,7 @@ def minimal_app_payload(error: str = ""):
                        WHERE ub.user_id = %s ORDER BY ub.earned_at DESC""",
                     (user_id,),
                 )
-                badges_data = cursor.fetchall()
+                badges_data = [display_badge(row) for row in cursor.fetchall()]
             if db_table_exists("xp_events"):
                 daily_quest_claimed = has_daily_quest_claim(user_id, daily_quest)
     except Exception as exc:
@@ -466,13 +474,21 @@ def init_db():
         app.logger.warning("Database initialization skipped: %s", exc)
 
 
+def display_badge(badge):
+    # Keep the historical database identity so earned badges are never reset or duplicated.
+    if badge["name"] == "10 Hours Taught":
+        return {**badge, "name": "First Session Taught",
+                "description": "Completed your first session as a mentor."}
+    return badge
+
+
 def seed_sample_data():
     conn = get_db()
     with conn.cursor() as cursor:
         default_badges = (
             ("First Session Completed", "learning", "Completed your first session."),
             ("Skill Hunter", "learning", "Completed 5 learning sessions."),
-            ("10 Hours Taught", "teaching", "You taught 10 hours of value."),
+            ("10 Hours Taught", "teaching", "Completed your first session as a mentor."),
             ("Guide Master", "teaching", "Completed 5 teaching sessions."),
             ("Skill Sharer", "skill", "Added your first teachable skill."),
             ("Conversation Starter", "social", "Started your first skill chat."),
@@ -1318,8 +1334,9 @@ def award_badges(user_id: int):
             if badge_id and value >= threshold and badge_id not in existing_ids:
                 cursor.execute("INSERT INTO user_badges (user_id, badge_id) VALUES (%s, %s)", (user_id, badge_id))
                 existing_ids.add(badge_id)
-                unlocked.append(badge_name)
-                create_notification(user_id, "badge", f"You unlocked the {badge_name} badge.")
+                display_name = display_badge({"name": badge_name})["name"]
+                unlocked.append(display_name)
+                create_notification(user_id, "badge", f"You unlocked the {display_name} badge.")
     unlocked.extend(award_progress_badges(user_id))
     return unlocked
 
@@ -1666,7 +1683,7 @@ def dashboard():
         cursor.execute("SELECT * FROM notifications WHERE user_id = %s ORDER BY created_at DESC LIMIT 6", (session["user_id"],))
         notifications = cursor.fetchall()
         cursor.execute("SELECT * FROM user_badges ub JOIN badges b ON ub.badge_id = b.id WHERE ub.user_id = %s", (session["user_id"],))
-        badges = cursor.fetchall()
+        badges = [display_badge(row) for row in cursor.fetchall()]
         cursor.execute("SELECT * FROM transactions WHERE user_id = %s ORDER BY created_at DESC LIMIT 8", (session["user_id"],))
         transactions = cursor.fetchall()
     return render_template(
@@ -2508,6 +2525,8 @@ def verify_checkout_payment(table):
         raise PaymentVerificationError("Payment verification details are missing.", 400)
     order_id = payload.get("razorpay_order_id")
     payment_id = payload.get("razorpay_payment_id")
+    if not isinstance(payload.get("razorpay_signature"), str) or not payload["razorpay_signature"]:
+        raise PaymentVerificationError("Payment signature is missing.", 400)
     if not isinstance(order_id, str) or not order_id or len(order_id) > 120 or not valid_payment_id(payment_id):
         raise PaymentVerificationError("Invalid payment verification details.", 400)
     _, secret = payment_keys()
@@ -2597,11 +2616,15 @@ def api_purchase_credits():
             },
             timeout=15,
         )
-        order = response.json()
+        order = response.json() if response.status_code < 400 else {}
     except (requests.RequestException, ValueError):
         app.logger.exception("Razorpay order create failed")
-        return jsonify({"error": "Could not start payment. Please try again shortly."}), 502
-    if (response.status_code >= 400 or not isinstance(order, dict) or not order.get("id")
+        return jsonify({"error": "Could not start payment. Please try again shortly."}), 500
+    if response.status_code == 401:
+        return jsonify({"error": "Payment provider authentication failed. Please contact support."}), 401
+    if response.status_code >= 400:
+        return jsonify({"error": "Razorpay could not create the order. Please try again shortly."}), 500
+    if (not isinstance(order, dict) or not order.get("id")
             or order.get("amount") != amount_paise or order.get("currency") != "INR"):
         return jsonify({"error": "Razorpay could not create the expected order."}), 502
     ensure_payment_tables()
@@ -2672,11 +2695,15 @@ def api_create_donation():
             },
             timeout=15,
         )
-        order = response.json()
+        order = response.json() if response.status_code < 400 else {}
     except (requests.RequestException, ValueError):
         app.logger.exception("Razorpay donation order create failed")
-        return jsonify({"error": "Could not start donation. Please try again shortly."}), 502
-    if (response.status_code >= 400 or not isinstance(order, dict) or not order.get("id")
+        return jsonify({"error": "Could not start donation. Please try again shortly."}), 500
+    if response.status_code == 401:
+        return jsonify({"error": "Payment provider authentication failed. Please contact support."}), 401
+    if response.status_code >= 400:
+        return jsonify({"error": "Razorpay could not create the donation order. Please try again shortly."}), 500
+    if (not isinstance(order, dict) or not order.get("id")
             or order.get("amount") != amount_paise or order.get("currency") != "INR"):
         return jsonify({"error": "Razorpay could not create the expected donation order."}), 502
     ensure_payment_tables()
@@ -3393,7 +3420,7 @@ def api_message_thread(contact_id):
                  AND m.deleted_for_everyone = 0
                  AND NOT (m.sender_id = %s AND m.deleted_for_sender = 1)
                  AND NOT (m.receiver_id = %s AND m.deleted_for_receiver = 1)
-               ORDER BY m.created_at""",
+               ORDER BY m.created_at, m.id""",
             (session["user_id"], contact_id, contact_id, session["user_id"], session["user_id"], session["user_id"]),
         )
         items = cursor.fetchall()

@@ -1,6 +1,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { guardianNotice, meetingUrl, nextLearnerQuiz } from './sessionRules.js';
+import { guardianNotice, meetingUrl, nextLearnerQuiz, sessionChatContact } from './sessionRules.js';
+
+test('accepted session chat opens the other participant for either role', () => {
+  const item = { learner_id: 2, mentor_id: 3, status: 'accepted' };
+  for (const status of ['accepted', 'scheduled', 'awaiting_confirmation', 'completed', 'missed']) {
+    assert.equal(sessionChatContact({ ...item, status }, 3), 2);
+    assert.equal(sessionChatContact({ ...item, status }, 2), 3);
+    assert.equal(sessionChatContact({ ...item, status }, 99), null);
+  }
+  for (const status of ['pending', 'cancelled']) {
+    assert.equal(sessionChatContact({ ...item, status }, 3), null);
+  }
+});
 
 test('guardian thresholds include online under 13 and offline under 16', () => {
   for (const [age, mode, required] of [[12,'online',true],[13,'online',false],[15,'offline',true],[16,'offline',false]]) {
