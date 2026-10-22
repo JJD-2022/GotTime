@@ -126,5 +126,16 @@ Live checkouts require `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, and the separat
 `RAZORPAY_WEBHOOK_SECRET`. Configure the dashboard webhook and automatic capture
 before accepting payments. Refund reconciliation remains manual.
 
+The direct UPI donation card is configured separately from Razorpay. Set
+`DONATION_UPI_ID` to your actual recipient UPI ID and `DONATION_UPI_NAME` to the
+recipient display name. A local `.env` value is not pushed to GitHub or Render.
+In Render, open the service's **Environment** settings, add or update just these
+two variables, and choose **Save, rebuild, and deploy**. Do not upload the entire
+local `.env`, which may contain local database settings and other credentials.
+See [Render's environment variable instructions](https://render.com/docs/configure-environment-variables).
+After deployment, sign in and open Donations to check the QR and recipient ID.
+The card offers retry on loading failures and a UPI ID/link fallback if the QR
+image cannot load. Direct UPI transfers are not verified by the Razorpay checkout flow.
+
 Connection configuration tests (no database required):
 `python -m unittest discover -s tests -p test_db_connection.py -v`

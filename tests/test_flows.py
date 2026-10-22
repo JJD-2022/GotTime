@@ -421,6 +421,18 @@ class Flows(unittest.TestCase):
         self.assertEqual(self.sql('SELECT COUNT(*) n FROM transactions WHERE user_id=%s',(self.learner,))[0]['n'],1)
         self.assertEqual(self.sql("SELECT COUNT(*) n FROM notifications WHERE user_id=%s AND type='credit'",(self.learner,))[0]['n'],1)
 
+    def test_upi_config_is_trimmed_and_exposes_only_public_payment_details(self):
+        with patch.dict(backend.app.config, {'DONATION_UPI_ID': ' demo@bank ', 'DONATION_UPI_NAME': ' GotTime '}):
+            result = self.request(self.learner, '/api/donations/upi', method='GET')
+            self.assertEqual(result.status_code, 200)
+            self.assertEqual(result.json, {'upiId': 'demo@bank', 'payeeName': 'GotTime'})
+            self.assertEqual(result.headers['Cache-Control'], 'no-store')
+        with patch.dict(backend.app.config, {'DONATION_UPI_ID': ' ', 'DONATION_UPI_NAME': ' '}):
+            result = self.request(self.learner, '/api/donations/upi', method='GET')
+            self.assertEqual(result.json, {'upiId': '', 'payeeName': 'GotTime'})
+        with backend.app.test_client() as client:
+            self.assertEqual(client.get('/api/donations/upi').status_code, 401)
+
     def payment_fixture(self, donation=False):
         config = patch.dict(backend.app.config, RAZORPAY_KEY_ID='rzp_test_audit',
                             RAZORPAY_KEY_SECRET='audit-only-secret', RAZORPAY_WEBHOOK_SECRET='audit-webhook-secret')

@@ -2676,10 +2676,12 @@ def api_verify_credit_payment():
 @app.get("/api/donations/upi")
 @api_login_required
 def api_donation_upi():
-    return jsonify({
-        "upiId": app.config["DONATION_UPI_ID"],
-        "payeeName": app.config["DONATION_UPI_NAME"],
+    response = jsonify({
+        "upiId": (app.config.get("DONATION_UPI_ID") or "").strip(),
+        "payeeName": (app.config.get("DONATION_UPI_NAME") or "").strip() or "GotTime",
     })
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.post("/api/donations/create")

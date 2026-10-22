@@ -1533,6 +1533,9 @@ input:focus, textarea:focus, select:focus { border-color: #7aa465; box-shadow: 0
 }
 .upi-qr-placeholder b { color: var(--ink); }
 .upi-qr-placeholder span { font-size: 12px; line-height: 1.35; }
+.upi-qr-box { max-width: 280px; text-align: center; }
+.upi-qr-box > span { font-size: 12px; color: var(--muted); }
+.upi-address { max-width: 100%; overflow-wrap: anywhere; user-select: all; }
 :root[data-theme="dark"] .credit-float { border-color: rgba(222,247,190,.22); box-shadow: 0 18px 60px rgba(0,0,0,.46); }
 :root[data-theme="dark"] .subscription-card { background: rgba(255,255,255,.055); border-color: rgba(255,255,255,.14); }
 :root[data-theme="dark"] .donation-panel,
