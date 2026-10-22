@@ -133,9 +133,9 @@ In Render, open the service's **Environment** settings, add or update just these
 two variables, and choose **Save, rebuild, and deploy**. Do not upload the entire
 local `.env`, which may contain local database settings and other credentials.
 See [Render's environment variable instructions](https://render.com/docs/configure-environment-variables).
-After deployment, sign in and open Donations to check the QR and recipient ID.
-The card offers retry on loading failures and a UPI ID/link fallback if the QR
-image cannot load. Direct UPI transfers are not verified by the Razorpay checkout flow.
+After deployment, sign in and open Donations to check the QR code. The payment
+area shows only the QR code once ready, with a retry option if loading fails.
+Direct UPI transfers are not verified by the Razorpay checkout flow.
 
 Connection configuration tests (no database required):
 `python -m unittest discover -s tests -p test_db_connection.py -v`
