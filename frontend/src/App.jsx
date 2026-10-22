@@ -12,6 +12,8 @@ import { createCheckoutFeedback } from "./checkoutFeedback";
 import { quizOptionState } from "./quizResults";
 import { checkBookingAvailability } from "./bookingAvailability";
 import DonationUpiPanel from "./DonationUpiPanel";
+import CreditUpiCard from "./CreditUpiCard";
+import { razorpayPaymentOptions } from "./razorpayCheckout";
 import { questDay, questIsCurrent, questCount as dailyQuestCount, questResetDelay } from "./dailyQuest";
 
 const navItems = [
@@ -940,7 +942,7 @@ function SubscriptionPage({ data, buyCredits, setPage }) {
     { id: "boost", name: "Skill boost", credits: 12, price: 199, note: "Best for active learners", tone: "violet", popular: true },
     { id: "pro", name: "Deep learner", credits: 30, price: 449, note: "For project-style learning", tone: "peach" },
   ];
-  return <div className="page subscription-page"><section className="subscription-hero"><div><span className="eyebrow"><Coins size={15} /> Credit wallet</span><h1>Ran out of credits?<br /><em>Top up and keep learning.</em></h1><p>Buy credit packs securely with cards, wallets, or netbanking, then spend credits to book mentors.</p><div className="wallet-chip"><Coins size={18} /><span><b>{data.user.credits || 0}</b> credits available</span></div></div><button className="soft-button" onClick={() => setPage("discover")}>Browse mentors <ArrowRight size={16} /></button></section><section className="subscription-grid">{packs.map((pack) => <article className={`subscription-card card-${pack.tone} ${pack.popular ? "popular" : ""}`} key={pack.id}>{pack.popular && <span className="popular-pill">Most useful</span>}<div className="subscription-icon"><Coins size={24} /></div><h3>{pack.name}</h3><p>{pack.note}</p><div className="subscription-price"><b>{"\u20B9"}{pack.price}</b><span>{pack.credits} credits</span></div><small>About {pack.credits} one-hour mentor sessions</small><button className="primary full" onClick={() => buyCredits(pack.id)}>Buy {pack.credits} credits <ArrowRight size={17} /></button></article>)}</section><section className="content-card subscription-note"><div><h3>How credit packs work</h3><p>Credits are used inside GotTime to book sessions. You can still earn credits by teaching; buying packs is just a quick top-up when you want to keep learning.</p></div><div className="tag-row"><span>1 credit = 1 session</span><span>Earn by teaching</span><span>Spend by learning</span></div></section></div>;
+  return <div className="page subscription-page"><section className="subscription-hero"><div><span className="eyebrow"><Coins size={15} /> Credit wallet</span><h1>Ran out of credits?<br /><em>Top up and keep learning.</em></h1><p>Buy credit packs securely with UPI, cards, wallets, or netbanking, then spend credits to book mentors.</p><div className="wallet-chip"><Coins size={18} /><span><b>{data.user.credits || 0}</b> credits available</span></div></div><button className="soft-button" onClick={() => setPage("discover")}>Browse mentors <ArrowRight size={16} /></button></section><section className="subscription-grid">{packs.map((pack) => <article className={`subscription-card card-${pack.tone} ${pack.popular ? "popular" : ""}`} key={pack.id}>{pack.popular && <span className="popular-pill">Most useful</span>}<div className="subscription-icon"><Coins size={24} /></div><h3>{pack.name}</h3><p>{pack.note}</p><div className="subscription-price"><b>{"\u20B9"}{pack.price}</b><span>{pack.credits} credits</span></div><small>About {pack.credits} one-hour mentor sessions</small><button className="primary full" onClick={() => buyCredits(pack.id)}>Buy {pack.credits} credits <ArrowRight size={17} /></button></article>)}</section><CreditUpiCard packs={packs} buyCredits={buyCredits} /><section className="content-card subscription-note"><div><h3>How credit packs work</h3><p>Credits are used inside GotTime to book sessions. You can still earn credits by teaching; buying packs is just a quick top-up when you want to keep learning.</p></div><div className="tag-row"><span>1 credit = 1 session</span><span>Earn by teaching</span><span>Spend by learning</span></div></section></div>;
 }
 const requestDonationUpi = (signal) => api("/api/donations/upi", { signal });
 function DonationPage({ donateSupport, setPage }) {
@@ -1544,18 +1546,7 @@ export default function App() {
       throw e;
     }
   };
-  const razorpayMethodConfig = {
-    display: {
-      blocks: {
-        cards: { name: "Cards", instruments: [{ method: "card" }] },
-        netbanking: { name: "Netbanking", instruments: [{ method: "netbanking" }] },
-        wallets: { name: "Wallets", instruments: [{ method: "wallet" }] },
-      },
-      sequence: ["block.cards", "block.netbanking", "block.wallets"],
-      preferences: { show_default_blocks: false },
-    },
-  };
-  const buyCredits = async (packageId) => {
+  const buyCredits = async (packageId, { upiOnly = false } = {}) => {
     try {
       const result = await api("/api/credits/purchase", { method: "POST", body: JSON.stringify({ packageId }) });
       await loadExternalScript("https://checkout.razorpay.com/v1/checkout.js");
@@ -1571,8 +1562,7 @@ export default function App() {
         order_id: result.order.id,
         prefill: { name: data?.user?.username || "", email: data?.user?.email || "" },
         theme: { color: "#2f7a62" },
-        method: { card: true, netbanking: true, wallet: true },
-        config: razorpayMethodConfig,
+        ...razorpayPaymentOptions(upiOnly),
         handler: async (response) => {
           feedback.paymentReceived();
           try {
@@ -1606,8 +1596,7 @@ export default function App() {
         order_id: result.order.id,
         prefill: { name: data?.user?.username || "", email: data?.user?.email || "" },
         theme: { color: "#2f7a62" },
-        method: { card: true, netbanking: true, wallet: true },
-        config: razorpayMethodConfig,
+        ...razorpayPaymentOptions(),
         handler: async (response) => {
           feedback.paymentReceived();
           try {
