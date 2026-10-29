@@ -14,6 +14,7 @@ import { checkBookingAvailability } from "./bookingAvailability";
 import DonationUpiPanel from "./DonationUpiPanel";
 import { razorpayPaymentOptions } from "./razorpayCheckout";
 import { refreshProfileStats, formatRating } from "./profileRatings";
+import { createMissedSessionNotices } from "./missedSessionNotices";
 import { questDay, questIsCurrent, questCount as dailyQuestCount, questResetDelay } from "./dailyQuest";
 
 const navItems = [
@@ -1206,6 +1207,8 @@ function SwipeHint({ direction }) {
 
 export default function App() {
   const loadingData = useRef(false);
+  const missedNotices = useRef(createMissedSessionNotices(localStorage, sessionStorage));
+  const missedNoticeUser = useRef(null);
   const promptedQuizzes = useRef(new Set());
   const [entrySession, setEntrySession] = useState(null);
   const [user, setUser] = useState(undefined), [data, setData] = useState(null), [page, setPage] = useState(() => appPages.includes(localStorage.getItem("gt-page")) ? localStorage.getItem("gt-page") : "home"), [theme, setTheme] = useState(() => localStorage.getItem("gt-theme") || "light");
@@ -1322,13 +1325,14 @@ export default function App() {
   }, [data?.user?.id, data?.dailyQuest?.date]);
   useEffect(() => { if (user?.id && user.id !== "restoring") ensureMessageKey(user.id).catch(() => {}); }, [user?.id]);
   useEffect(() => {
-    if (!data?.user?.id) return;
-    const missed = (data.sessions || []).filter((item) => item.status === "missed");
-    if (!missed.length) return;
-    const storageKey = `gt-missed-popup-dismissed-${data.user.id}`;
-    const dismissed = new Set(JSON.parse(sessionStorage.getItem(storageKey) || "[]"));
-    const unseen = missed.filter((item) => !dismissed.has(String(item.id)));
-    if (unseen.length) setMissedPopup(unseen);
+    const userId = data?.user?.id ?? null;
+    if (missedNoticeUser.current !== userId) {
+      setMissedPopup(null);
+      missedNoticeUser.current = userId;
+    }
+    if (!userId) return;
+    const unseen = missedNotices.current.takeUnseen(data.sessions, userId);
+    if (unseen.length) setMissedPopup((previous) => [...(previous || []), ...unseen]);
   }, [data?.user?.id, data?.sessions]);
   // Legacy encryption runs only for the opened chat, so unopened messages stay unread.
   useEffect(() => { dailyQuestClaiming.current = Boolean(data?.dailyQuestClaimed); }, [data?.dailyQuestClaimed, data?.dailyQuest?.date]);
@@ -1488,12 +1492,6 @@ export default function App() {
   };
   const logout = async () => { await api("/api/auth/logout", { method: "POST" }); clearAuthToken(); localStorage.removeItem("gt-page"); localStorage.removeItem("gt-page-history"); localStorage.removeItem("gt-forward-history"); setNeedsBirthdate(false); setUser(null); setData(null); setPage("home"); };
   const closeMissedPopup = () => {
-    if (missedPopup?.length && data?.user?.id) {
-      const storageKey = `gt-missed-popup-dismissed-${data.user.id}`;
-      const dismissed = new Set(JSON.parse(sessionStorage.getItem(storageKey) || "[]"));
-      missedPopup.forEach((item) => dismissed.add(String(item.id)));
-      sessionStorage.setItem(storageKey, JSON.stringify([...dismissed]));
-    }
     setMissedPopup(null);
   };
     const closeAppRating = () => {
