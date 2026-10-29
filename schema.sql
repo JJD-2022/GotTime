@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS users (
   age INT DEFAULT 18,
   xp INT DEFAULT 0,
   streak INT DEFAULT 0,
+  last_visit_on DATE NULL,
   sessions_completed INT DEFAULT 0,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   reset_token VARCHAR(255),

@@ -79,6 +79,51 @@ class Flows(unittest.TestCase):
         self.assertEqual(self.sql('SELECT balance FROM credits WHERE user_id=%s',(self.learner,))[0]['balance'],9)
         self.assertEqual(self.sql('SELECT COUNT(*) n FROM transactions WHERE related_session_id=%s',(sid,))[0]['n'],2)
 
+    def test_app_visit_streak_starts_repeats_advances_and_restarts(self):
+        today = backend.today_ist()
+        for offset, expected in [(0, 1), (0, 1), (1, 2), (2, 3), (4, 1), (4, 1)]:
+            with patch.object(backend, 'today_ist', return_value=today + timedelta(days=offset)):
+                result = self.request(self.learner, '/api/app', method='GET')
+                self.assertEqual(result.status_code, 200)
+                self.assertEqual(result.json['user']['streak'], expected)
+                self.assertEqual(self.request(self.learner, '/api/auth/me', method='GET').json['user']['streak'], expected)
+        row = self.sql('SELECT streak,last_visit_on FROM users WHERE id=%s', (self.learner,))[0]
+        self.assertEqual(row, {'streak': 1, 'last_visit_on': today + timedelta(days=4)})
+        self.assertEqual(self.sql('SELECT balance FROM credits WHERE user_id=%s', (self.learner,))[0]['balance'], 10)
+
+    def test_parallel_app_visits_increment_streak_only_once(self):
+        self.sql('UPDATE users SET streak=4,last_visit_on=%s WHERE id=%s',
+                 (backend.today_ist() - timedelta(days=1), self.learner))
+        def visit(_):
+            with backend.app.app_context():
+                backend.record_app_visit(self.learner)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(visit, range(12)))
+        self.assertEqual(self.sql('SELECT streak FROM users WHERE id=%s', (self.learner,))[0]['streak'], 5)
+
+    def test_streak_expires_in_profiles_and_does_not_count_other_users_visits(self):
+        today = backend.today_ist()
+        self.sql('UPDATE credits SET balance=100000 WHERE user_id=%s', (self.mentor,))
+        self.sql('UPDATE users SET streak=7,last_visit_on=%s WHERE id=%s', (today - timedelta(days=2), self.mentor))
+        result = self.request(self.learner, '/api/app', method='GET')
+        for source in ['mentors', 'leaderboard']:
+            mentor = next(row for row in result.json[source] if row['id'] == self.mentor)
+            self.assertEqual(mentor['streak'], 0)
+        self.assertEqual(self.request(self.mentor, '/api/auth/me', method='GET').json['user']['streak'], 0)
+        self.assertEqual(self.sql('SELECT last_visit_on FROM users WHERE id=%s', (self.mentor,))[0]['last_visit_on'], today - timedelta(days=2))
+        self.assertEqual(self.request(self.mentor, '/api/app', method='GET').json['user']['streak'], 1)
+
+    def test_anonymous_app_request_does_not_record_a_visit(self):
+        with backend.app.test_client() as client:
+            self.assertEqual(client.get('/api/app').status_code, 401)
+        self.assertIsNone(self.sql('SELECT last_visit_on FROM users WHERE id=%s', (self.learner,))[0]['last_visit_on'])
+
+    def test_visit_tracking_waits_for_schema_upgrade(self):
+        with patch.object(backend, 'db_column_exists', return_value=False), patch.object(backend, 'get_db') as database:
+            backend.record_app_visit(self.learner)
+            self.assertEqual(backend.active_streak_select(), '0 AS streak')
+            database.assert_not_called()
+
     def test_failed_completion_rolls_everything_back(self):
         sid = self.session('awaiting_confirmation', True)
         with patch.object(backend, 'award_badges', side_effect=RuntimeError('simulate failure')):
@@ -410,6 +455,65 @@ class Flows(unittest.TestCase):
         self.assertEqual(self.request(self.learner,f'/api/sessions/{sid}/rating',{'score':5}).status_code,403)
         self.assertEqual(self.request(self.learner,f'/api/sessions/{sid}/confirm').status_code,200)
         self.assertEqual(self.request(self.learner,f'/api/sessions/{sid}/rating',{'score':5,'feedback':'Helpful'}).status_code,200)
+
+    def test_saved_rating_reaches_mentor_profile_and_updates_average(self):
+        # Keep this mentor visible in the limited leaderboard fixture.
+        self.sql('UPDATE credits SET balance=100000 WHERE user_id=%s', (self.mentor,))
+        sid = self.session('completed', True)
+        before = self.request(self.mentor, '/api/auth/me', method='GET').json['user']
+        self.assertEqual(float(before['rating']), 0)
+        self.assertEqual(before['rating_count'], 0)
+
+        def check_average(expected, count):
+            own = self.request(self.mentor, '/api/app', method='GET')
+            self.assertEqual(own.status_code, 200, own.json)
+            self.assertEqual(float(own.json['user']['rating']), expected)
+            self.assertEqual(own.json['user']['rating_count'], count)
+            auth = self.request(self.mentor, '/api/auth/me', method='GET').json['user']
+            self.assertEqual(float(auth['rating']), expected)
+            viewer = self.request(self.learner, '/api/app', method='GET').json
+            mentor = next(row for row in viewer['mentors'] if row['id'] == self.mentor)
+            leader = next(row for row in viewer['leaderboard'] if row['id'] == self.mentor)
+            self.assertEqual(float(mentor['rating']), expected)
+            self.assertEqual(float(leader['rating']), expected)
+            self.assertEqual(leader['rating_count'], count)
+            self.assertEqual(float(viewer['user']['rating']), 0)
+
+        self.assertEqual(self.request(self.learner, f'/api/sessions/{sid}/rating', {'score': 5}).status_code, 200)
+        check_average(5, 1)
+        second = self.session('completed', True)
+        self.assertEqual(self.request(self.learner, f'/api/sessions/{second}/rating', {'score': 3}).status_code, 200)
+        check_average(4, 2)
+        # Editing a previous rating changes the average, not the rating count.
+        self.assertEqual(self.request(self.learner, f'/api/sessions/{sid}/rating', {'score': 1}).status_code, 200)
+        check_average(2, 2)
+
+    def test_profile_counts_real_completions_without_rewriting_wallet_or_history(self):
+        self.sql('UPDATE credits SET balance=100000 WHERE user_id=%s', (self.mentor,))
+        self.sql('UPDATE users SET sessions_completed=0, streak=3, last_visit_on=%s WHERE id=%s',
+                 (backend.today_ist(), self.mentor))
+        self.session('completed', True)
+        self.session('completed', True)
+        for status in ['pending', 'accepted', 'scheduled', 'awaiting_confirmation', 'cancelled', 'missed']:
+            self.session(status)
+        # Include a completed learning session on this mentor's personal profile.
+        self.sql('INSERT INTO sessions(learner_id,mentor_id,skill_id,status,scheduled_for) VALUES (%s,%s,%s,%s,%s)',
+                 (self.mentor, self.learner, self.skill, 'completed', self.time))
+        own = self.request(self.mentor, '/api/app', method='GET')
+        self.assertEqual(own.status_code, 200, own.json)
+        self.assertEqual(own.json['user']['sessions_completed'], 3)
+        self.assertEqual(own.json['user']['credits'], 100000)
+        self.assertEqual(own.json['user']['streak'], 3)
+        # A rating ensures this fixture is in the limited mentor directory.
+        sid = self.session('completed', True)
+        self.assertEqual(self.request(self.learner, f'/api/sessions/{sid}/rating', {'score': 5}).status_code, 200)
+        viewer = self.request(self.learner, '/api/app', method='GET').json
+        for collection in ['mentors', 'leaderboard']:
+            row = next(row for row in viewer[collection] if row['id'] == self.mentor)
+            self.assertEqual(row['sessions_completed'], 4)
+        # Reading profiles does not repair by making financial or history mutations.
+        self.assertEqual(self.sql('SELECT sessions_completed FROM users WHERE id=%s', (self.mentor,))[0]['sessions_completed'], 0)
+        self.assertEqual(self.sql('SELECT balance FROM credits WHERE user_id=%s', (self.mentor,))[0]['balance'], 100000)
 
     def test_payment_credit_retry_is_idempotent(self):
         payment, body = self.payment_fixture()
