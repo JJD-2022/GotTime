@@ -112,7 +112,8 @@ Use a Python web service with the repository root as its working directory.
   continues to use port 3306 and the existing local connection behavior.
 
 Initialize a new hosted database with `python manage.py init` before serving requests.
-For upgrades that add schema fields (including daily visit streaks), run this command
+For upgrades that add schema fields or tables (including daily visit streaks and
+community feedback), run this command
 once against the existing hosted database before starting the new release. It adds
 missing fields without clearing existing users, sessions, ratings, or balances.
 For an initial single-instance deployment without a separate migration runner, temporarily

@@ -334,6 +334,7 @@ em { color: var(--green); font-style: normal; }
 .testimonial-card > small { width: fit-content; padding: 6px 9px; color: var(--green); background: var(--surface-2); border-radius: 999px; font-weight: 800; }
 .testimonial-cta { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
 .testimonial-cta h3 { margin-bottom: 4px; }
+.community-feedback-message { white-space: pre-wrap; overflow-wrap: anywhere; }
 .testimonial-cta p { margin: 0; color: var(--muted); font-size: 12px; }
 
 /* Refined knowledge-app landing */
@@ -1542,6 +1543,7 @@ input:focus, textarea:focus, select:focus { border-color: #7aa465; box-shadow: 0
 .dashboard-columns { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(260px, .7fr); gap: 17px; margin-bottom: 17px; }
 .dashboard-columns.lower { grid-template-columns: 1.25fr 1fr; }
 .dashboard-stories { margin-top: 0; }
+.dashboard-stories + .testimonial-cta { margin-top: 12px; }
 .dashboard-story-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 .dashboard-story { min-height: 142px; display: flex; align-items: stretch; flex-direction: column; gap: 12px; padding: 16px; color: var(--ink); background: var(--surface-2); border: 1px solid var(--line); border-radius: 18px; text-align: left; cursor: pointer; transition: transform .14s ease, border-color .14s ease, background .14s ease; }
 .dashboard-story:hover { transform: translateY(-1px); border-color: color-mix(in srgb, var(--green) 28%, var(--line)); background: color-mix(in srgb, var(--surface-2) 78%, var(--lime)); }

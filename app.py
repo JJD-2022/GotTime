@@ -2359,6 +2359,39 @@ def api_app_data():
         return jsonify({"error": "Could not load your workspace. Please retry."}), 503
 
 
+def feedback_story(cursor, feedback_id):
+    cursor.execute(
+        """SELECT f.id, f.message, f.created_at, u.username AS name
+           FROM community_feedback f JOIN users u ON u.id = f.user_id
+           WHERE f.id = %s AND u.is_active = 1""", (feedback_id,),
+    )
+    return cursor.fetchone()
+
+
+@app.route("/api/feedback", methods=["GET", "POST"])
+@api_login_required
+def api_community_feedback():
+    if not db_table_exists("community_feedback"):
+        return jsonify({"error": "Feedback is not available yet. Please try again after the database upgrade."}), 503
+    if request.method == "GET":
+        with get_db().cursor() as cursor:
+            cursor.execute(
+                """SELECT f.id, f.message, f.created_at, u.username AS name
+                   FROM community_feedback f JOIN users u ON u.id = f.user_id
+                   WHERE u.is_active = 1 ORDER BY f.id DESC LIMIT 50"""
+            )
+            return jsonify({"stories": cursor.fetchall()})
+    payload = request.get_json(silent=True)
+    message = payload.get("message") if isinstance(payload, dict) else None
+    if not isinstance(message, str) or not 1 <= len(message.strip()) <= 2000:
+        return jsonify({"error": "Enter feedback between 1 and 2,000 characters."}), 400
+    with get_db().cursor() as cursor:
+        cursor.execute("INSERT INTO community_feedback (user_id, message) VALUES (%s, %s)",
+                       (session["user_id"], message.strip()))
+        story = feedback_story(cursor, cursor.lastrowid)
+    return jsonify({"story": story}), 201
+
+
 @app.patch("/api/profile")
 @api_login_required
 def api_update_profile():

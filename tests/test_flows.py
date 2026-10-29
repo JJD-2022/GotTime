@@ -79,6 +79,38 @@ class Flows(unittest.TestCase):
         self.assertEqual(self.sql('SELECT balance FROM credits WHERE user_id=%s',(self.learner,))[0]['balance'],9)
         self.assertEqual(self.sql('SELECT COUNT(*) n FROM transactions WHERE related_session_id=%s',(sid,))[0]['n'],2)
 
+    def test_community_feedback_persists_and_uses_authenticated_author(self):
+        self.sql('UPDATE users SET username=%s WHERE id=%s', ('Actual author', self.learner))
+        result = self.request(self.learner, '/api/feedback', {'message': '  My real feedback  ',
+                              'userId': self.mentor, 'name': 'Spoofed', 'email': 'private@example.test'})
+        self.assertEqual(result.status_code, 201)
+        story = result.json['story']
+        self.assertEqual(story['name'], 'Actual author')
+        self.assertEqual(story['message'], 'My real feedback')
+        self.assertEqual(set(story), {'id', 'name', 'message', 'created_at'})
+        self.assertEqual(self.sql('SELECT user_id FROM community_feedback WHERE id=%s', (story['id'],))[0]['user_id'], self.learner)
+        # A different browser/user reads the same persisted submission.
+        listing = self.request(self.mentor, '/api/feedback', method='GET')
+        self.assertEqual(listing.status_code, 200)
+        self.assertIn(story, listing.json['stories'])
+        self.sql('UPDATE users SET is_active=0 WHERE id=%s', (self.learner,))
+        listing = self.request(self.mentor, '/api/feedback', method='GET')
+        self.assertNotIn(story, listing.json['stories'])
+
+    def test_community_feedback_validates_input_and_requires_login(self):
+        for message in ['', '   ', 123, ['text'], 'x' * 2001, None]:
+            self.assertEqual(self.request(self.learner, '/api/feedback', {'message': message}).status_code, 400)
+        self.assertEqual(self.request(self.learner, '/api/feedback', ['invalid']).status_code, 400)
+        self.assertEqual(self.request(self.learner, '/api/feedback', {'message': 'x' * 2000}).status_code, 201)
+        with backend.app.test_client() as client:
+            self.assertEqual(client.get('/api/feedback').status_code, 401)
+            self.assertEqual(client.post('/api/feedback', json={'message': 'anonymous'}).status_code, 401)
+
+    def test_community_feedback_reports_pending_schema_upgrade(self):
+        with patch.object(backend, 'db_table_exists', return_value=False):
+            self.assertEqual(self.request(self.learner, '/api/feedback', method='GET').status_code, 503)
+            self.assertEqual(self.request(self.learner, '/api/feedback', {'message': 'not saved'}).status_code, 503)
+
     def test_app_visit_streak_starts_repeats_advances_and_restarts(self):
         today = backend.today_ist()
         for offset, expected in [(0, 1), (0, 1), (1, 2), (2, 3), (4, 1), (4, 1)]:
