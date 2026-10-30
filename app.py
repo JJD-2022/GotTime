@@ -168,6 +168,24 @@ def redirect_google_failure(reason):
     return google_error_redirect("google_server")
 
 
+MENTOR_REVIEWS_FROM = """FROM ratings r
+    JOIN sessions rated ON rated.id = r.session_id
+      AND rated.mentor_id = r.ratee_id AND rated.learner_id = r.rater_id
+    LEFT JOIN skills sk ON sk.id = rated.skill_id
+    LEFT JOIN reviews review ON review.id = (
+        SELECT MAX(rv.id) FROM reviews rv
+        WHERE rv.session_id = r.session_id AND rv.reviewer_id = r.rater_id
+          AND rv.reviewee_id = r.ratee_id AND CHAR_LENGTH(TRIM(rv.content)) > 0)
+    WHERE rated.status = 'completed' AND r.score BETWEEN 1 AND 5"""
+
+
+def mentor_rating_stats_select():
+    source = MENTOR_REVIEWS_FROM + " AND r.ratee_id = u.id"
+    return f"""(SELECT COALESCE(AVG(r.score), 0) {source}) AS rating,
+               (SELECT COUNT(*) {source}) AS rating_count,
+               (SELECT COUNT(review.id) {source}) AS review_count"""
+
+
 def minimal_app_payload(error: str = ""):
     user = current_user()
     user_id = user["id"] if user else session.get("user_id")
@@ -219,7 +237,7 @@ def minimal_app_payload(error: str = ""):
                            {mentor_banner_style_select}, {mentor_banner_image_select},
                            (SELECT COUNT(*) FROM sessions done WHERE (done.learner_id = u.id OR done.mentor_id = u.id)
                             AND done.status = 'completed') AS sessions_completed,
-                           COALESCE(AVG(r.score), 0) AS rating, {streak_select},
+                           {mentor_rating_stats_select()}, {streak_select},
                            us.id AS mentor_skill_id,
                            sk.id AS skill_id,
                            sk.name AS primary_skill,
@@ -232,7 +250,6 @@ def minimal_app_payload(error: str = ""):
                     FROM users u
                     JOIN user_skills us ON us.user_id = u.id
                     JOIN skills sk ON sk.id = us.skill_id
-                    LEFT JOIN ratings r ON r.ratee_id = u.id
                     WHERE u.id != %s AND u.is_active = 1
                     GROUP BY us.id, u.id, sk.id
                     ORDER BY rating DESC, sessions_completed DESC, u.username, us.created_at DESC
@@ -246,8 +263,7 @@ def minimal_app_payload(error: str = ""):
                            COALESCE(c.balance, 0) AS credits, {streak_select},
                            (SELECT COUNT(*) FROM sessions done WHERE (done.learner_id = u.id OR done.mentor_id = u.id)
                             AND done.status = 'completed') AS sessions_completed,
-                           COALESCE((SELECT AVG(r.score) FROM ratings r WHERE r.ratee_id = u.id), 0) AS rating,
-                           (SELECT COUNT(*) FROM ratings r WHERE r.ratee_id = u.id) AS rating_count
+                           {mentor_rating_stats_select()}
                     FROM users u LEFT JOIN credits c ON c.user_id = u.id
                     WHERE u.is_active = 1 ORDER BY credits DESC, sessions_completed DESC LIMIT 10"""
             )
@@ -2107,8 +2123,7 @@ def current_user():
                       {needs_birthdate_select},
                       {age_select}, {xp_select}, {streak_select}, {sessions_completed_select}, u.created_at,
                       COALESCE(c.balance, 0) AS credits,
-                      COALESCE((SELECT AVG(r.score) FROM ratings r WHERE r.ratee_id = u.id), 0) AS rating,
-                      (SELECT COUNT(*) FROM ratings r WHERE r.ratee_id = u.id) AS rating_count
+                      {mentor_rating_stats_select()}
                FROM users u LEFT JOIN credits c ON c.user_id = u.id
                WHERE u.id = %s AND u.is_active = 1""",
             (session["user_id"],),
@@ -2357,6 +2372,35 @@ def api_app_data():
     except Exception:
         app.logger.exception("App data failed")
         return jsonify({"error": "Could not load your workspace. Please retry."}), 503
+
+
+@app.get("/api/mentors/<int:mentor_id>/reviews")
+@api_login_required
+def api_mentor_reviews(mentor_id):
+    try:
+        page = int(request.args.get("page", "1"))
+        if not 1 <= page <= 100000:
+            raise ValueError
+    except (ValueError, TypeError):
+        return jsonify({"error": "Choose a valid review page."}), 400
+    page_size = 20
+    with get_db().cursor() as cursor:
+        cursor.execute("SELECT id, username FROM users WHERE id = %s AND is_active = 1", (mentor_id,))
+        mentor = cursor.fetchone()
+        if not mentor:
+            return jsonify({"error": "This mentor is unavailable."}), 404
+        source = MENTOR_REVIEWS_FROM + " AND r.ratee_id = %s"
+        cursor.execute(f"SELECT COALESCE(AVG(r.score), 0) AS rating, COUNT(*) AS rating_count, COUNT(review.id) AS review_count {source}", (mentor_id,))
+        summary = cursor.fetchone()
+        cursor.execute(
+            f"""SELECT r.id, r.score, COALESCE(sk.name, 'Skill session') AS skill_name,
+                       DATE_FORMAT(rated.scheduled_for, '%%Y-%%m-%%d') AS session_date,
+                       review.content AS feedback
+                {source} ORDER BY r.created_at DESC, r.id DESC LIMIT %s OFFSET %s""",
+            (mentor_id, page_size, (page - 1) * page_size),
+        )
+        return jsonify({"mentor": mentor, "summary": summary, "reviews": cursor.fetchall(),
+                        "page": page, "has_more": page * page_size < summary["rating_count"]})
 
 
 def feedback_story(cursor, feedback_id):

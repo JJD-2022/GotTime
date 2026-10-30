@@ -2,6 +2,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { refreshProfileStats, formatRating } from "./profileRatings.js";
 
+test("rating and written-review counts refresh with the average, including zero", () => {
+  const result = refreshProfileStats({ id: 2, rating: 5, rating_count: 1, review_count: 1 },
+    { mentors: [{ id: 2, rating: 4, rating_count: 2, review_count: 0 }] });
+  assert.equal(result.rating, 4);
+  assert.equal(result.rating_count, 2);
+  assert.equal(result.review_count, 0);
+});
+
 test("own profile gets its freshly returned average", () => {
   assert.equal(refreshProfileStats({ id: 1, rating: 0 }, { user: { id: 1, rating: "4.5" } }).rating, "4.5");
 });

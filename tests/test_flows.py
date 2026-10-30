@@ -79,6 +79,83 @@ class Flows(unittest.TestCase):
         self.assertEqual(self.sql('SELECT balance FROM credits WHERE user_id=%s',(self.learner,))[0]['balance'],9)
         self.assertEqual(self.sql('SELECT COUNT(*) n FROM transactions WHERE related_session_id=%s',(sid,))[0]['n'],2)
 
+    def test_mentor_reviews_match_profile_average_and_show_optional_feedback(self):
+        self.sql('UPDATE credits SET balance=100000 WHERE user_id=%s', (self.mentor,))
+        sid1, sid2 = self.session('completed'), self.session('completed')
+        self.assertEqual(self.request(self.learner, f'/api/sessions/{sid1}/rating', {'score': 5, 'feedback': 'Very clear explanations'}).status_code, 200)
+        self.assertEqual(self.request(self.learner, f'/api/sessions/{sid2}/rating', {'score': 3}).status_code, 200)
+        # Two skills must not duplicate ratings in the directory.
+        second = self.sql("INSERT INTO skills(name,category) VALUES ('Singing','Music')")
+        self.sql('INSERT INTO user_skills(user_id,skill_id) VALUES (%s,%s)', (self.mentor, second))
+        other = self.user(balance=0)
+        result = self.request(other, f'/api/mentors/{self.mentor}/reviews', method='GET')
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(float(result.json['summary']['rating']), 4)
+        self.assertEqual(result.json['summary']['rating_count'], 2)
+        self.assertEqual(result.json['summary']['review_count'], 1)
+        self.assertFalse(result.json['has_more'])
+        entries = result.json['reviews']
+        self.assertEqual([entry['score'] for entry in entries], [3, 5])
+        self.assertIsNone(entries[0]['feedback'])
+        self.assertEqual(entries[1]['feedback'], 'Very clear explanations')
+        self.assertEqual(set(entries[0]), {'id', 'score', 'skill_name', 'session_date', 'feedback'})
+        self.assertEqual(entries[0]['skill_name'], 'Python')
+        self.assertEqual(set(result.json['mentor']), {'id', 'username'})
+        app_data = self.request(other, '/api/app', method='GET').json
+        for source in ['mentors', 'leaderboard']:
+            matches = [person for person in app_data[source] if person['id'] == self.mentor]
+            self.assertTrue(matches)
+            for person in matches:
+                self.assertEqual(float(person['rating']), 4)
+                self.assertEqual(person['rating_count'], 2)
+                self.assertEqual(person['review_count'], 1)
+        own = self.request(self.mentor, '/api/auth/me', method='GET').json['user']
+        self.assertEqual(float(own['rating']), 4)
+        self.assertEqual(own['review_count'], 1)
+        # Editing the rating/removing feedback updates the average and list.
+        self.request(self.learner, f'/api/sessions/{sid1}/rating', {'score': 1, 'feedback': ''})
+        updated = self.request(other, f'/api/mentors/{self.mentor}/reviews', method='GET').json
+        self.assertEqual(float(updated['summary']['rating']), 2)
+        self.assertEqual(updated['summary']['rating_count'], 2)
+        self.assertEqual(updated['summary']['review_count'], 0)
+
+    def test_mentor_reviews_filter_invalid_sessions_and_keep_mentors_separate(self):
+        valid = self.session('completed')
+        invalid = self.session('pending')
+        self.request(self.learner, f'/api/sessions/{valid}/rating', {'score': 4, 'feedback': 'Good session'})
+        for sid, ratee, rater in [(invalid, self.mentor, self.learner), (valid, self.learner, self.mentor)]:
+            self.sql('INSERT INTO ratings(session_id,ratee_id,rater_id,score) VALUES (%s,%s,%s,5)', (sid, ratee, rater))
+        self.sql('INSERT INTO reviews(session_id,reviewer_id,reviewee_id,content) VALUES (%s,%s,%s,%s)',
+                 (valid, self.learner, self.mentor, 'Latest feedback'))
+        result = self.request(self.learner, f'/api/mentors/{self.mentor}/reviews', method='GET').json
+        self.assertEqual(result['summary']['rating_count'], 1)
+        self.assertEqual(result['summary']['review_count'], 1)
+        self.assertEqual(result['reviews'][0]['feedback'], 'Latest feedback')
+        empty = self.request(self.mentor, f'/api/mentors/{self.learner}/reviews', method='GET').json
+        self.assertEqual(empty['reviews'], [])
+        self.assertEqual(float(empty['summary']['rating']), 0)
+
+    def test_mentor_reviews_paginate_and_require_valid_authenticated_requests(self):
+        for _ in range(21):
+            sid = self.session('completed')
+            self.sql('INSERT INTO ratings(session_id,rater_id,ratee_id,score) VALUES (%s,%s,%s,5)', (sid,self.learner,self.mentor))
+        path = f'/api/mentors/{self.mentor}/reviews'
+        first = self.request(self.learner, path, method='GET').json
+        second = self.request(self.learner, path+'?page=2', method='GET').json
+        self.assertEqual(len(first['reviews']), 20)
+        self.assertTrue(first['has_more'])
+        self.assertEqual(len(second['reviews']), 1)
+        self.assertFalse(second['has_more'])
+        self.assertFalse({row['id'] for row in first['reviews']} & {row['id'] for row in second['reviews']})
+        self.assertEqual(first['summary'], second['summary'])
+        for page in ['0', '-1', 'bad', '100001']:
+            self.assertEqual(self.request(self.learner, path+'?page='+page, method='GET').status_code, 400)
+        self.assertEqual(self.request(self.learner, '/api/mentors/0/reviews', method='GET').status_code, 404)
+        with backend.app.test_client() as client:
+            self.assertEqual(client.get(path).status_code, 401)
+        self.sql('UPDATE users SET is_active=0 WHERE id=%s', (self.mentor,))
+        self.assertEqual(self.request(self.learner, path, method='GET').status_code, 404)
+
     def test_community_feedback_persists_and_uses_authenticated_author(self):
         self.sql('UPDATE users SET username=%s WHERE id=%s', ('Actual author', self.learner))
         result = self.request(self.learner, '/api/feedback', {'message': '  My real feedback  ',

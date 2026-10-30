@@ -6,7 +6,7 @@ export function refreshProfileStats(profile, data) {
   ];
   const refreshed = { ...profile };
   // Keep the selected skill/banner, but don't freeze the impact snapshot.
-  for (const key of ["rating", "sessions_completed", "credits", "streak"]) {
+  for (const key of ["rating", "rating_count", "review_count", "sessions_completed", "credits", "streak"]) {
     const source = sources.find((person) => person?.[key] != null);
     if (source) refreshed[key] = source[key];
   }

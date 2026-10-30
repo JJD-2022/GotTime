@@ -1842,6 +1842,25 @@ input:focus, textarea:focus, select:focus { border-color: #7aa465; box-shadow: 0
 .mentor-preview-card:focus { outline: 0; }
 .mentor-preview-card:focus-visible { outline: 2px solid color-mix(in srgb, var(--green) 45%, transparent); outline-offset: 3px; }
 .mentor-view-more { display: inline-flex; align-items: center; gap: 6px; margin-top: 12px; color: var(--green); font-size: 12px; font-weight: 900; }
+.mentor-view-more { padding: 0; border: 0; background: none; text-align: left; }
+.mentor-review-controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.mentor-review-controls button { display: inline-flex; align-items: center; gap: 6px; min-height: 34px; padding: 6px 9px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); color: var(--green); font: inherit; font-size: 12px; cursor: pointer; }
+.mentor-review-controls button:hover, .impact-rating-button:hover { outline: 1px solid var(--green); }
+.mentor-review-controls button:focus-visible, .impact-rating-button:focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }
+.mentor-list-view .mentor-review-controls, .mentor-list-view .mentor-detail-body > h4, .mentor-list-view .mentor-detail-body > p { grid-column: 1; }
+.mentor-list-view .mentor-review-controls { margin: 0; }
+.mentor-review-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 20px 0; color: var(--green); }
+.mentor-review-summary strong { font-size: 24px; }
+.mentor-review-summary span { width: 100%; color: var(--muted); }
+.mentor-review-list { display: grid; gap: 12px; }
+.mentor-session-review { padding: 16px; border: 1px solid var(--line); border-radius: 16px; background: var(--surface-2); }
+.mentor-session-review header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+.mentor-session-review h3 { margin: 0 0 5px; font-size: 16px; }
+.mentor-session-review small, .review-no-feedback { color: var(--muted); }
+.mentor-session-review p { margin-bottom: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.mentor-review-stars { display: inline-flex; align-items: center; gap: 3px; color: #a57720; }
+.mentor-review-stars b { margin-left: 5px; }
+.mentor-review-pagination { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 18px; }
 .mentor-profile-page { max-width: 980px; }
 .back-link { margin-bottom: 12px; }
 .mentor-full-card { max-width: 860px; }
@@ -2022,6 +2041,7 @@ input:focus, textarea:focus, select:focus { border-color: #7aa465; box-shadow: 0
 .profile-grid { display: grid; grid-template-columns: 1fr 1.2fr; gap: 17px; margin-top: 17px; }
 .impact-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
 .impact-grid div { display: grid; grid-template-columns: 28px 1fr; padding: 12px; background: var(--surface-2); border-radius: 12px; }
+.impact-grid > .impact-rating-button { display: grid; grid-template-columns: 28px 1fr; padding: 12px; background: var(--surface-2); border: 0; border-radius: 12px; color: var(--ink); text-align: left; cursor: pointer; }
 .impact-grid svg { grid-row: 1 / 3; align-self: center; color: #6d9a47; }
 .impact-grid b { font: 800 14px "Manrope"; }
 .impact-grid span { color: var(--muted); font-size: 8px; }
