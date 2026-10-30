@@ -131,7 +131,7 @@ class Flows(unittest.TestCase):
             self.assertEqual(self.request(self.mentor, f'/api/users/{self.learner}/activity', method='GET').json['active_days'], [])
         self.assertEqual(self.sql('SELECT COUNT(*) n FROM user_activity_days WHERE user_id=%s', (self.mentor,))[0]['n'], 3)
 
-    def test_activity_calendar_preserves_known_last_visit_without_inventing_history(self):
+    def test_activity_calendar_recovers_only_the_recorded_consecutive_run(self):
         today = backend.today_ist().replace(day=15)
         last = today - timedelta(days=1)
         self.sql('UPDATE users SET streak=4,last_visit_on=%s WHERE id=%s', (last,self.mentor))
@@ -140,7 +140,7 @@ class Flows(unittest.TestCase):
         path = f'/api/users/{self.mentor}/activity'
         with patch.object(backend, 'today_ist', return_value=today):
             result = self.request(self.learner, path, method='GET').json
-        self.assertEqual(result['active_days'], [last.isoformat(), today.isoformat()])
+        self.assertEqual(result['active_days'], [(today - timedelta(days=offset)).isoformat() for offset in range(4, -1, -1)])
         self.assertEqual(result['streak'], 5)
         self.assertIn('Older visits', result['history_note'])
         for month in ['bad', '2026-13', '2026-1', '1999-12', '2026-01-01']:
@@ -148,6 +148,41 @@ class Flows(unittest.TestCase):
         with backend.app.test_client() as client:
             self.assertEqual(client.get(path).status_code, 401)
         self.assertEqual(self.request(self.mentor, '/api/users/0/activity', method='GET').status_code, 404)
+
+    def test_activity_calendar_two_day_legacy_streak_highlights_both_days(self):
+        today = date(2026, 10, 30)
+        self.sql('UPDATE users SET streak=2,last_visit_on=%s WHERE id=%s', (today, self.mentor))
+        self.sql('INSERT INTO user_activity_days(user_id,activity_date) VALUES (%s,%s)', (self.mentor, today))
+        path = f'/api/users/{self.mentor}/activity'
+        with patch.object(backend, 'today_ist', return_value=today):
+            result = self.request(self.learner, path, method='GET').json
+        self.assertEqual(result['streak'], 2)
+        self.assertEqual(result['active_days'], ['2026-10-29', '2026-10-30'])
+        # A later gap must not erase the recovered older run.
+        later = date(2026, 11, 2)
+        with patch.object(backend, 'today_ist', return_value=later), backend.app.app_context():
+            backend.record_app_visit(self.mentor)
+        with patch.object(backend, 'today_ist', return_value=later):
+            history = self.request(self.mentor, path+'?month=2026-10', method='GET').json
+        self.assertEqual(history['streak'], 1)
+        self.assertEqual(history['active_days'], ['2026-10-29', '2026-10-30'])
+
+    def test_activity_calendar_streak_spanning_months_stays_in_its_actual_dates(self):
+        today = date(2027, 1, 1)
+        self.sql('UPDATE users SET streak=2,last_visit_on=%s WHERE id=%s', (today, self.mentor))
+        path = f'/api/users/{self.mentor}/activity'
+        with patch.object(backend, 'today_ist', return_value=today):
+            january = self.request(self.learner, path, method='GET').json
+            december = self.request(self.learner, path+'?month=2026-12', method='GET').json
+        self.assertEqual(january['streak'], 2)
+        self.assertEqual(january['active_days'], ['2027-01-01'])
+        self.assertEqual(december['active_days'], ['2026-12-31'])
+
+    def test_recorded_streak_recovery_excludes_future_and_unknown_history(self):
+        today = date(2026, 10, 30)
+        self.assertEqual(backend.recorded_streak_days(None, 7, today), set())
+        self.assertEqual(backend.recorded_streak_days(today + timedelta(days=1), 2, today), set())
+        self.assertEqual(backend.recorded_streak_days(today, 0, today), {today})
 
     def test_missed_notice_is_persistent_per_account_and_session(self):
         sid = self.session('missed')

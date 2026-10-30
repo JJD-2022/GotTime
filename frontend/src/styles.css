@@ -2058,7 +2058,7 @@ input:focus, textarea:focus, select:focus { border-color: #7aa465; box-shadow: 0
 .profile-session-item p { margin: 6px 0; }
 .profile-session-item small { color: var(--muted); }
 .profile-session-complete { display: inline-flex; align-items: center; gap: 5px; color: var(--green); font-size: 12px; }
-.streak-calendar { margin-top: 16px; }
+.streak-calendar { position: relative; margin-top: 16px; }
 .streak-calendar-summary { display: flex; align-items: center; gap: 8px; color: var(--green); }
 .streak-calendar-navigation { display: flex; justify-content: space-between; align-items: center; margin: 18px 0; gap: 10px; }
 .streak-calendar-navigation h3 { margin: 0; font-size: 18px; }
@@ -2068,9 +2068,9 @@ input:focus, textarea:focus, select:focus { border-color: #7aa465; box-shadow: 0
 .streak-day.active-day { color: var(--green); background: var(--mint); }
 .streak-day.active-day svg { position: absolute; bottom: 2px; right: 3px; }
 .streak-day.today { border-color: var(--green); }
-.streak-calendar-legend { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); margin-top: 18px; }
-.streak-calendar-legend > span { width: 14px; height: 14px; border-radius: 4px; background: var(--mint); flex-shrink: 0; }
-.streak-history-note { display: block; color: var(--muted); line-height: 1.5; }
+.streak-day.empty { visibility: hidden; }
+.streak-calendar-loading { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.streak-calendar-error { position: absolute; inset: 90px 0 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 20px; border-radius: 14px; background: var(--surface); text-align: center; }
 .badge-row { display: flex; justify-content: space-around; gap: 14px; }
 .badge-row > div { display: flex; align-items: center; flex: 1; flex-direction: column; text-align: center; }
 .badge-medal { width: 58px; height: 58px; display: grid; place-items: center; color: #668d3d; background: #e6f1c9; border-radius: 18px 18px 24px 24px; transform: rotate(-3deg); }

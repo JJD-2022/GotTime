@@ -4,7 +4,8 @@ export function monthCells(month) {
   const count = new Date(Date.UTC(year, number, 0)).getUTCDate();
   const cells = Array(offset).fill(null);
   for (let day = 1; day <= count; day++) cells.push(`${month}-${String(day).padStart(2, "0")}`);
-  while (cells.length % 7) cells.push(null);
+  // Keep every month the same height, including February and six-week months.
+  while (cells.length < 42) cells.push(null);
   return cells;
 }
 

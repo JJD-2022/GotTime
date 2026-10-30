@@ -1222,6 +1222,18 @@ def active_streak_select():
             "THEN COALESCE(u.streak, 0) ELSE 0 END AS streak")
 
 
+def recorded_streak_days(last_visit, streak, today, start=None, end=None):
+    """Recover the consecutive dates encoded by the server's saved streak counter."""
+    if not last_visit or last_visit > today:
+        return set()
+    count = max(1, int(streak or 0))
+    first = last_visit - timedelta(days=min(count - 1, last_visit.toordinal() - 1))
+    if start:
+        first = max(first, start)
+    last = min(last_visit, end - timedelta(days=1)) if end else last_visit
+    return {first + timedelta(days=offset) for offset in range(max(0, (last - first).days + 1))}
+
+
 def ensure_activity_days_table():
     with get_db().cursor() as cursor:
         cursor.execute("""CREATE TABLE IF NOT EXISTS user_activity_days (
@@ -1246,11 +1258,19 @@ def record_app_visit(user_id):
 def record_daily_activity(user_id):
     today = today_ist()
     with get_db().cursor() as cursor:
-        cursor.execute("SELECT id FROM users WHERE id = %s FOR UPDATE", (user_id,))
-        # Preserve the one historical date we actually know; do not invent older visits.
-        cursor.execute("""INSERT IGNORE INTO user_activity_days (user_id, activity_date)
-                          SELECT id, last_visit_on FROM users WHERE id = %s AND is_active = 1
-                          AND last_visit_on IS NOT NULL AND last_visit_on <= %s""", (user_id, today))
+        cursor.execute("SELECT id, streak, last_visit_on, is_active FROM users WHERE id = %s FOR UPDATE", (user_id,))
+        person = cursor.fetchone()
+        if not person or not person["is_active"]:
+            return
+        # Preserve the existing consecutive run before a later visit can reset it.
+        known_days = recorded_streak_days(person["last_visit_on"], person["streak"], today)
+        if known_days:
+            cursor.execute("""SELECT activity_date FROM user_activity_days WHERE user_id = %s
+                              AND activity_date BETWEEN %s AND %s""", (user_id, min(known_days), max(known_days)))
+            missing_days = known_days - {row["activity_date"] for row in cursor.fetchall()}
+            if missing_days:
+                cursor.executemany("INSERT IGNORE INTO user_activity_days (user_id, activity_date) VALUES (%s, %s)",
+                                   [(user_id, day) for day in sorted(missing_days)])
         cursor.execute("""INSERT IGNORE INTO user_activity_days (user_id, activity_date)
                           SELECT id, %s FROM users WHERE id = %s AND is_active = 1""", (today, user_id))
         cursor.execute(
@@ -2442,7 +2462,7 @@ def api_profile_activity(user_id):
     end = (start.replace(day=28) + timedelta(days=4)).replace(day=1)
     last_visit_select = "u.last_visit_on" if db_column_exists("users", "last_visit_on") else "NULL AS last_visit_on"
     with get_db().cursor() as cursor:
-        cursor.execute(f"SELECT u.id, u.username, {active_streak_select()}, {last_visit_select} FROM users u WHERE u.id = %s AND u.is_active = 1", (user_id,))
+        cursor.execute(f"SELECT u.id, u.username, u.streak AS recorded_streak, {active_streak_select()}, {last_visit_select} FROM users u WHERE u.id = %s AND u.is_active = 1", (user_id,))
         person = cursor.fetchone()
         if not person:
             return jsonify({"error": "This profile is unavailable."}), 404
@@ -2452,8 +2472,7 @@ def api_profile_activity(user_id):
                               AND activity_date >= %s AND activity_date < %s AND activity_date <= %s""",
                            (user_id, start, end, today))
             days.update(row["activity_date"] for row in cursor.fetchall())
-        if person["last_visit_on"] and start <= person["last_visit_on"] < end and person["last_visit_on"] <= today:
-            days.add(person["last_visit_on"])
+        days.update(recorded_streak_days(person["last_visit_on"], person["recorded_streak"], today, start, end))
         return jsonify({"month": month, "today": today.isoformat(), "active_days": sorted(day.isoformat() for day in days),
                         "streak": person["streak"], "history_note": "Active-day history is recorded from this update. Older visits may not appear."})
 

@@ -6,7 +6,12 @@ test("calendar starts on Monday and has complete weeks", () => {
   const cells = monthCells("2026-10");
   assert.deepEqual(cells.slice(0, 4), [null, null, null, "2026-10-01"]);
   assert.equal(cells.filter(Boolean).length, 31);
-  assert.equal(cells.length % 7, 0);
+  assert.equal(cells.length, 42);
+});
+test("every month reserves six rows so navigating never changes calendar height", () => {
+  for (const month of ["2026-08", "2026-09", "2026-10", "2027-02", "2028-02"]) {
+    assert.equal(monthCells(month).length, 42);
+  }
 });
 test("leap years and year boundaries are handled without local timezone drift", () => {
   assert.equal(monthCells("2028-02").filter(Boolean).length, 29);
