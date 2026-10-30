@@ -64,6 +64,22 @@ CREATE TABLE IF NOT EXISTS sessions (
   FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS user_activity_days (
+  user_id INT NOT NULL,
+  activity_date DATE NOT NULL,
+  PRIMARY KEY (user_id, activity_date),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS missed_session_notices (
+  session_id INT NOT NULL,
+  user_id INT NOT NULL,
+  seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (session_id, user_id),
+  FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS credits (
   id INT AUTO_INCREMENT PRIMARY KEY,
   user_id INT NOT NULL UNIQUE,

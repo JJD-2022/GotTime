@@ -1,18 +1,14 @@
 import { useEffect, useState } from "react";
-import { MessageCircle, Star } from "lucide-react";
+import { Star } from "lucide-react";
 import { formatRating } from "./profileRatings";
 
 export function MentorReviewButtons({ mentor, onOpen }) {
   const count = Number(mentor.rating_count || 0);
-  const reviews = Number(mentor.review_count || 0);
   const open = (event) => { event.stopPropagation(); onOpen(mentor); };
   return <div className="mentor-review-controls">
     <button type="button" onClick={open} aria-label={`View ${mentor.username}'s ${count} ratings, average ${formatRating(mentor.rating, "unrated")}`}>
       <Star size={15} fill={count ? "currentColor" : "none"} />
       <span>{formatRating(mentor.rating, "New")} · {count} {count === 1 ? "rating" : "ratings"}</span>
-    </button>
-    <button type="button" onClick={open} aria-label={`View ${mentor.username}'s ${reviews} written reviews`}>
-      <MessageCircle size={15} /><span>{reviews} {reviews === 1 ? "review" : "reviews"}</span>
     </button>
   </div>;
 }

@@ -1222,13 +1222,37 @@ def active_streak_select():
             "THEN COALESCE(u.streak, 0) ELSE 0 END AS streak")
 
 
+def ensure_activity_days_table():
+    with get_db().cursor() as cursor:
+        cursor.execute("""CREATE TABLE IF NOT EXISTS user_activity_days (
+            user_id INT NOT NULL,
+            activity_date DATE NOT NULL,
+            PRIMARY KEY (user_id, activity_date),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )""")
+
+
 def record_app_visit(user_id):
     """Count one authenticated workspace visit per calendar day, atomically."""
     # Keep existing deployments usable until the explicit schema upgrade runs.
     if not db_column_exists("users", "last_visit_on"):
         return
+    if not db_table_exists("user_activity_days"):
+        ensure_activity_days_table()
+    return record_daily_activity(user_id)
+
+
+@atomic
+def record_daily_activity(user_id):
     today = today_ist()
     with get_db().cursor() as cursor:
+        cursor.execute("SELECT id FROM users WHERE id = %s FOR UPDATE", (user_id,))
+        # Preserve the one historical date we actually know; do not invent older visits.
+        cursor.execute("""INSERT IGNORE INTO user_activity_days (user_id, activity_date)
+                          SELECT id, last_visit_on FROM users WHERE id = %s AND is_active = 1
+                          AND last_visit_on IS NOT NULL AND last_visit_on <= %s""", (user_id, today))
+        cursor.execute("""INSERT IGNORE INTO user_activity_days (user_id, activity_date)
+                          SELECT id, %s FROM users WHERE id = %s AND is_active = 1""", (today, user_id))
         cursor.execute(
             """UPDATE users
                SET streak = CASE WHEN last_visit_on = %s THEN COALESCE(streak, 0) + 1 ELSE 1 END,
@@ -2374,6 +2398,120 @@ def api_app_data():
         return jsonify({"error": "Could not load your workspace. Please retry."}), 503
 
 
+@app.get("/api/users/<int:user_id>/completed-sessions")
+@api_login_required
+def api_profile_completed_sessions(user_id):
+    try:
+        page = int(request.args.get("page", "1"))
+        if not 1 <= page <= 100000:
+            raise ValueError
+    except (ValueError, TypeError):
+        return jsonify({"error": "Choose a valid session page."}), 400
+    with get_db().cursor() as cursor:
+        cursor.execute("SELECT id, username FROM users WHERE id = %s AND is_active = 1", (user_id,))
+        person = cursor.fetchone()
+        if not person:
+            return jsonify({"error": "This profile is unavailable."}), 404
+        cursor.execute("""SELECT COUNT(*) AS total FROM sessions
+                          WHERE (learner_id = %s OR mentor_id = %s) AND status = 'completed'""", (user_id, user_id))
+        total = cursor.fetchone()["total"]
+        cursor.execute("""SELECT s.id, COALESCE(sk.name, 'Skill session') AS skill_name,
+                          DATE_FORMAT(s.scheduled_for, '%%Y-%%m-%%d') AS session_date,
+                          CASE WHEN s.mentor_id = %s THEN 'Taught' ELSE 'Learned' END AS role,
+                          CASE WHEN %s = %s THEN other.username ELSE NULL END AS counterpart_name
+                          FROM sessions s LEFT JOIN skills sk ON sk.id = s.skill_id
+                          LEFT JOIN users other ON other.id = CASE WHEN s.mentor_id = %s THEN s.learner_id ELSE s.mentor_id END
+                          WHERE (s.learner_id = %s OR s.mentor_id = %s) AND s.status = 'completed'
+                          ORDER BY COALESCE(s.scheduled_for, s.created_at) DESC, s.id DESC LIMIT 20 OFFSET %s""",
+                       (user_id, session["user_id"], user_id, user_id, user_id, user_id, (page - 1) * 20))
+        return jsonify({"user": person, "sessions": cursor.fetchall(), "total": total,
+                        "page": page, "has_more": page * 20 < total})
+
+
+@app.get("/api/users/<int:user_id>/activity")
+@api_login_required
+def api_profile_activity(user_id):
+    today = today_ist()
+    month = request.args.get("month", today.strftime("%Y-%m"))
+    try:
+        start = datetime.strptime(month, "%Y-%m").date()
+        if start.strftime("%Y-%m") != month or not 2000 <= start.year <= 2100:
+            raise ValueError
+    except (ValueError, TypeError):
+        return jsonify({"error": "Choose a valid calendar month."}), 400
+    end = (start.replace(day=28) + timedelta(days=4)).replace(day=1)
+    last_visit_select = "u.last_visit_on" if db_column_exists("users", "last_visit_on") else "NULL AS last_visit_on"
+    with get_db().cursor() as cursor:
+        cursor.execute(f"SELECT u.id, u.username, {active_streak_select()}, {last_visit_select} FROM users u WHERE u.id = %s AND u.is_active = 1", (user_id,))
+        person = cursor.fetchone()
+        if not person:
+            return jsonify({"error": "This profile is unavailable."}), 404
+        days = set()
+        if db_table_exists("user_activity_days"):
+            cursor.execute("""SELECT activity_date FROM user_activity_days WHERE user_id = %s
+                              AND activity_date >= %s AND activity_date < %s AND activity_date <= %s""",
+                           (user_id, start, end, today))
+            days.update(row["activity_date"] for row in cursor.fetchall())
+        if person["last_visit_on"] and start <= person["last_visit_on"] < end and person["last_visit_on"] <= today:
+            days.add(person["last_visit_on"])
+        return jsonify({"month": month, "today": today.isoformat(), "active_days": sorted(day.isoformat() for day in days),
+                        "streak": person["streak"], "history_note": "Active-day history is recorded from this update. Older visits may not appear."})
+
+
+def ensure_missed_notice_table():
+    # Additive, idempotent bootstrap for deployed apps without a migration runner.
+    # This runs before the claim transaction so DDL cannot commit its writes early.
+    with get_db().cursor() as cursor:
+        cursor.execute("""CREATE TABLE IF NOT EXISTS missed_session_notices (
+            session_id INT NOT NULL,
+            user_id INT NOT NULL,
+            seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (session_id, user_id),
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )""")
+
+
+@atomic
+def claim_missed_notices(user_id, session_ids, previously_seen):
+    claimed = []
+    with get_db().cursor() as cursor:
+        cursor.execute("SELECT id FROM users WHERE id = %s FOR UPDATE", (user_id,))
+        placeholders = ",".join(["%s"] * len(session_ids))
+        cursor.execute(
+            f"""SELECT id FROM sessions WHERE id IN ({placeholders}) AND status = 'missed'
+                AND (learner_id = %s OR mentor_id = %s) ORDER BY id""",
+            (*session_ids, user_id, user_id),
+        )
+        for item in cursor.fetchall():
+            cursor.execute("INSERT IGNORE INTO missed_session_notices (session_id, user_id) VALUES (%s, %s)",
+                           (item["id"], user_id))
+            if cursor.rowcount == 1 and item["id"] not in previously_seen:
+                claimed.append(item["id"])
+    return jsonify({"session_ids": claimed})
+
+
+@app.post("/api/sessions/missed-notices/claim")
+@api_login_required
+def api_claim_missed_notices():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Provide the missed session IDs."}), 400
+    ids, seen = payload.get("session_ids"), payload.get("previously_seen", [])
+    for values in (ids, seen):
+        if not isinstance(values, list) or len(values) > 500 or any(type(value) is not int or value <= 0 for value in values):
+            return jsonify({"error": "Provide up to 500 valid session IDs."}), 400
+    if not ids:
+        return jsonify({"session_ids": []})
+    if not db_table_exists("missed_session_notices"):
+        try:
+            ensure_missed_notice_table()
+        except Exception:
+            app.logger.exception("Could not initialize missed-session notice tracking")
+            return jsonify({"error": "Missed-session notice tracking is temporarily unavailable."}), 503
+    return claim_missed_notices(session["user_id"], sorted(set(ids)), set(seen))
+
+
 @app.get("/api/mentors/<int:mentor_id>/reviews")
 @api_login_required
 def api_mentor_reviews(mentor_id):
@@ -2403,6 +2541,30 @@ def api_mentor_reviews(mentor_id):
                         "page": page, "has_more": page * page_size < summary["rating_count"]})
 
 
+@app.get("/api/birthdays/today")
+@api_login_required
+def api_birthdays_today():
+    today = today_ist()
+    with get_db().cursor() as cursor:
+        cursor.execute("""SELECT id, username FROM users
+            WHERE is_active = 1 AND id <> %s AND birthdate <= %s
+              AND MONTH(birthdate) = %s AND DAY(birthdate) = %s
+            ORDER BY username, id""", (session["user_id"], today, today.month, today.day))
+        return jsonify({"date": today.isoformat(), "people": cursor.fetchall()})
+
+
+def ensure_community_feedback_table():
+    # Add only the missing table; never reinitialize the application's database.
+    with get_db().cursor() as cursor:
+        cursor.execute("""CREATE TABLE IF NOT EXISTS community_feedback (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            user_id INT NOT NULL,
+            message TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )""")
+
+
 def feedback_story(cursor, feedback_id):
     cursor.execute(
         """SELECT f.id, f.message, f.created_at, u.username AS name
@@ -2416,7 +2578,11 @@ def feedback_story(cursor, feedback_id):
 @api_login_required
 def api_community_feedback():
     if not db_table_exists("community_feedback"):
-        return jsonify({"error": "Feedback is not available yet. Please try again after the database upgrade."}), 503
+        try:
+            ensure_community_feedback_table()
+        except Exception:
+            app.logger.exception("Could not initialize community feedback storage")
+            return jsonify({"error": "Feedback is temporarily unavailable. Please try again shortly."}), 503
     if request.method == "GET":
         with get_db().cursor() as cursor:
             cursor.execute(

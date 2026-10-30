@@ -8,7 +8,7 @@ import hmac
 import json
 import base64
 from concurrent.futures import ThreadPoolExecutor
-from datetime import timedelta
+from datetime import date, timedelta
 from unittest.mock import patch, Mock
 import pymysql
 import app as backend
@@ -78,6 +78,119 @@ class Flows(unittest.TestCase):
         self.assertEqual(results.count(200), 1, results)
         self.assertEqual(self.sql('SELECT balance FROM credits WHERE user_id=%s',(self.learner,))[0]['balance'],9)
         self.assertEqual(self.sql('SELECT COUNT(*) n FROM transactions WHERE related_session_id=%s',(sid,))[0]['n'],2)
+
+    def test_profile_session_list_matches_count_and_hides_private_details(self):
+        self.session('completed')
+        self.session('completed')
+        self.session('pending')
+        self.session('missed')
+        self.sql("INSERT INTO sessions(learner_id,mentor_id,skill_id,status) VALUES (%s,%s,%s,'completed')",
+                 (self.mentor, self.learner, self.skill))
+        path = f'/api/users/{self.mentor}/completed-sessions'
+        own = self.request(self.mentor, path, method='GET')
+        self.assertEqual(own.status_code, 200)
+        self.assertEqual(own.json['total'], 3)
+        self.assertEqual(len(own.json['sessions']), 3)
+        self.assertEqual({row['role'] for row in own.json['sessions']}, {'Taught', 'Learned'})
+        self.assertTrue(all(row['counterpart_name'] for row in own.json['sessions']))
+        self.assertEqual(self.request(self.mentor, '/api/app', method='GET').json['user']['sessions_completed'], own.json['total'])
+        other = self.request(self.user(), path, method='GET').json
+        self.assertTrue(all(row['counterpart_name'] is None for row in other['sessions']))
+        self.assertEqual(set(other['sessions'][0]), {'id', 'skill_name', 'session_date', 'role', 'counterpart_name'})
+
+    def test_profile_session_list_pagination_and_auth(self):
+        for _ in range(21):
+            self.session('completed')
+        path = f'/api/users/{self.mentor}/completed-sessions'
+        first = self.request(self.learner, path, method='GET').json
+        second = self.request(self.learner, path+'?page=2', method='GET').json
+        self.assertEqual(first['total'], 21)
+        self.assertEqual(len(first['sessions']), 20)
+        self.assertTrue(first['has_more'])
+        self.assertEqual(len(second['sessions']), 1)
+        self.assertFalse(second['has_more'])
+        self.assertFalse({row['id'] for row in first['sessions']} & {row['id'] for row in second['sessions']})
+        for page in ['0', '-1', 'bad']:
+            self.assertEqual(self.request(self.learner, path+'?page='+page, method='GET').status_code, 400)
+        self.assertEqual(self.request(self.learner, '/api/users/0/completed-sessions', method='GET').status_code, 404)
+        with backend.app.test_client() as client:
+            self.assertEqual(client.get(path).status_code, 401)
+
+    def test_activity_calendar_records_real_days_once_across_months_and_gaps(self):
+        today = backend.today_ist().replace(month=10, day=2)
+        for offset in [-3, -2, 0, 0]:
+            with patch.object(backend, 'today_ist', return_value=today + timedelta(days=offset)), backend.app.app_context():
+                backend.record_app_visit(self.mentor)
+        path = f'/api/users/{self.mentor}/activity'
+        with patch.object(backend, 'today_ist', return_value=today):
+            october = self.request(self.mentor, path, method='GET').json
+            september = self.request(self.learner, path+f'?month={today.year}-09', method='GET').json
+            self.assertEqual(october['active_days'], [today.isoformat()])
+            self.assertEqual(september['active_days'], [(today-timedelta(days=3)).isoformat(), (today-timedelta(days=2)).isoformat()])
+            self.assertEqual(october['streak'], 1)
+            self.assertEqual(self.request(self.mentor, f'/api/users/{self.learner}/activity', method='GET').json['active_days'], [])
+        self.assertEqual(self.sql('SELECT COUNT(*) n FROM user_activity_days WHERE user_id=%s', (self.mentor,))[0]['n'], 3)
+
+    def test_activity_calendar_preserves_known_last_visit_without_inventing_history(self):
+        today = backend.today_ist().replace(day=15)
+        last = today - timedelta(days=1)
+        self.sql('UPDATE users SET streak=4,last_visit_on=%s WHERE id=%s', (last,self.mentor))
+        with patch.object(backend, 'today_ist', return_value=today), backend.app.app_context():
+            backend.record_app_visit(self.mentor)
+        path = f'/api/users/{self.mentor}/activity'
+        with patch.object(backend, 'today_ist', return_value=today):
+            result = self.request(self.learner, path, method='GET').json
+        self.assertEqual(result['active_days'], [last.isoformat(), today.isoformat()])
+        self.assertEqual(result['streak'], 5)
+        self.assertIn('Older visits', result['history_note'])
+        for month in ['bad', '2026-13', '2026-1', '1999-12', '2026-01-01']:
+            self.assertEqual(self.request(self.mentor, path+'?month='+month, method='GET').status_code, 400)
+        with backend.app.test_client() as client:
+            self.assertEqual(client.get(path).status_code, 401)
+        self.assertEqual(self.request(self.mentor, '/api/users/0/activity', method='GET').status_code, 404)
+
+    def test_missed_notice_is_persistent_per_account_and_session(self):
+        sid = self.session('missed')
+        path = '/api/sessions/missed-notices/claim'
+        payload = {'session_ids': [sid]}
+        self.assertEqual(self.request(self.mentor, path, payload).json['session_ids'], [sid])
+        # Each request has a new browser session; no local storage is needed.
+        self.assertEqual(self.request(self.mentor, path, payload).json['session_ids'], [])
+        self.assertEqual(self.request(self.learner, path, payload).json['session_ids'], [sid])
+        second = self.session('missed')
+        self.assertEqual(self.request(self.mentor, path, {'session_ids': [sid, second]}).json['session_ids'], [second])
+        self.assertEqual(self.sql('SELECT status FROM sessions WHERE id=%s', (sid,))[0]['status'], 'missed')
+        self.assertEqual(self.sql('SELECT balance FROM credits WHERE user_id=%s', (self.learner,))[0]['balance'], 10)
+        self.assertEqual(self.sql('SELECT COUNT(*) n FROM transactions WHERE related_session_id=%s', (sid,))[0]['n'], 0)
+
+    def test_parallel_missed_notice_claims_display_only_once(self):
+        sid = self.session('missed')
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda _: self.request(self.mentor, '/api/sessions/missed-notices/claim', {'session_ids': [sid]}).json['session_ids'], range(12)))
+        self.assertEqual(sum(sid in ids for ids in results), 1)
+        self.assertEqual(self.sql('SELECT COUNT(*) n FROM missed_session_notices WHERE session_id=%s AND user_id=%s', (sid, self.mentor))[0]['n'], 1)
+
+    def test_missed_notice_imports_old_dismissals_and_checks_ownership(self):
+        old, new, pending = self.session('missed'), self.session('missed'), self.session('pending')
+        path = '/api/sessions/missed-notices/claim'
+        self.assertEqual(self.request(self.mentor, path, {'session_ids': [old, new, pending], 'previously_seen': [old]}).json['session_ids'], [new])
+        self.assertEqual(self.request(self.mentor, path, {'session_ids': [old, new]}).json['session_ids'], [])
+        other = self.user()
+        self.assertEqual(self.request(other, path, {'session_ids': [old, new], 'previously_seen': [old]}).json['session_ids'], [])
+        self.assertEqual(self.sql('SELECT COUNT(*) n FROM missed_session_notices WHERE user_id=%s', (other,))[0]['n'], 0)
+        self.assertEqual(self.sql('SELECT COUNT(*) n FROM missed_session_notices WHERE session_id=%s', (pending,))[0]['n'], 0)
+
+    def test_missed_notice_validation_and_additive_bootstrap(self):
+        path = '/api/sessions/missed-notices/claim'
+        with backend.app.test_client() as client:
+            self.assertEqual(client.post(path, json={'session_ids': [1]}).status_code, 401)
+        for payload in [[], {}, {'session_ids': '1'}, {'session_ids': [True]}, {'session_ids': [-1]},
+                        {'session_ids': list(range(1, 502))}, {'session_ids': [1], 'previously_seen': '1'}]:
+            self.assertEqual(self.request(self.mentor, path, payload).status_code, 400)
+        sid = self.session('missed')
+        with patch.object(backend, 'db_table_exists', return_value=False):
+            self.assertEqual(self.request(self.mentor, path, {'session_ids': [sid]}).json['session_ids'], [sid])
+            self.assertEqual(self.request(self.mentor, path, {'session_ids': [sid]}).json['session_ids'], [])
 
     def test_mentor_reviews_match_profile_average_and_show_optional_feedback(self):
         self.sql('UPDATE credits SET balance=100000 WHERE user_id=%s', (self.mentor,))
@@ -156,6 +269,31 @@ class Flows(unittest.TestCase):
         self.sql('UPDATE users SET is_active=0 WHERE id=%s', (self.mentor,))
         self.assertEqual(self.request(self.learner, path, method='GET').status_code, 404)
 
+    def test_birthdays_show_other_active_users_without_private_birthdate(self):
+        self.sql("UPDATE users SET birthdate='2000-12-31' WHERE id IN (%s,%s)", (self.learner, self.mentor))
+        inactive = self.user()
+        self.sql("UPDATE users SET birthdate='1990-12-31',is_active=0 WHERE id=%s", (inactive,))
+        other_day = self.user()
+        self.sql("UPDATE users SET birthdate='2000-01-01' WHERE id=%s", (other_day,))
+        missing = self.user()
+        self.sql('UPDATE users SET birthdate=NULL WHERE id=%s', (missing,))
+        with patch.object(backend, 'today_ist', return_value=date(2026, 12, 31)):
+            result = self.request(self.learner, '/api/birthdays/today', method='GET')
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json['date'], '2026-12-31')
+        self.assertEqual([person['id'] for person in result.json['people']], [self.mentor])
+        self.assertEqual(set(result.json['people'][0]), {'id', 'username'})
+        with backend.app.test_client() as client:
+            self.assertEqual(client.get('/api/birthdays/today').status_code, 401)
+
+    def test_birthdays_follow_server_day_and_handle_leap_day(self):
+        self.sql("UPDATE users SET birthdate='2000-02-29' WHERE id=%s", (self.mentor,))
+        for day, expected in [(date(2028, 2, 28), False), (date(2028, 2, 29), True), (date(2028, 3, 1), False), (date(2027, 2, 28), False)]:
+            with patch.object(backend, 'today_ist', return_value=day):
+                result = self.request(self.learner, '/api/birthdays/today', method='GET')
+            self.assertEqual(result.json['date'], day.isoformat())
+            self.assertEqual(self.mentor in [person['id'] for person in result.json['people']], expected)
+
     def test_community_feedback_persists_and_uses_authenticated_author(self):
         self.sql('UPDATE users SET username=%s WHERE id=%s', ('Actual author', self.learner))
         result = self.request(self.learner, '/api/feedback', {'message': '  My real feedback  ',
@@ -183,10 +321,45 @@ class Flows(unittest.TestCase):
             self.assertEqual(client.get('/api/feedback').status_code, 401)
             self.assertEqual(client.post('/api/feedback', json={'message': 'anonymous'}).status_code, 401)
 
-    def test_community_feedback_reports_pending_schema_upgrade(self):
-        with patch.object(backend, 'db_table_exists', return_value=False):
-            self.assertEqual(self.request(self.learner, '/api/feedback', method='GET').status_code, 503)
-            self.assertEqual(self.request(self.learner, '/api/feedback', {'message': 'not saved'}).status_code, 503)
+    def test_community_feedback_initializes_missing_storage(self):
+        # Preserve fixtures; this runs only inside this suite's disposable database.
+        assert backend.app.config['MYSQL_DB'] == self.name
+        self.sql('RENAME TABLE community_feedback TO feedback_test_backup')
+        backend._schema_cache.clear()
+        try:
+            result = self.request(self.learner, '/api/feedback', method='GET')
+            self.assertEqual(result.status_code, 200)
+            self.assertEqual(result.json['stories'], [])
+            saved = self.request(self.learner, '/api/feedback', {'message': 'Works after upgrade'})
+            self.assertEqual(saved.status_code, 201)
+            # Repeated initialization must preserve submissions.
+            with backend.app.app_context():
+                backend.ensure_community_feedback_table()
+            listing = self.request(self.mentor, '/api/feedback', method='GET')
+            self.assertIn(saved.json['story'], listing.json['stories'])
+        finally:
+            self.sql('DROP TABLE IF EXISTS community_feedback')
+            self.sql('RENAME TABLE feedback_test_backup TO community_feedback')
+
+    def test_community_feedback_can_initialize_on_first_submission(self):
+        assert backend.app.config['MYSQL_DB'] == self.name
+        self.sql('RENAME TABLE community_feedback TO feedback_test_backup')
+        backend._schema_cache.clear()
+        try:
+            result = self.request(self.learner, '/api/feedback', {'message': 'First submission'})
+            self.assertEqual(result.status_code, 201)
+            self.assertEqual(result.json['story']['message'], 'First submission')
+        finally:
+            self.sql('DROP TABLE IF EXISTS community_feedback')
+            self.sql('RENAME TABLE feedback_test_backup TO community_feedback')
+
+    def test_community_feedback_initialization_failure_can_retry(self):
+        with patch.object(backend, 'db_table_exists', return_value=False), \
+                patch.object(backend, 'ensure_community_feedback_table', side_effect=RuntimeError('Unavailable')):
+            with self.assertLogs(backend.app.logger, level='ERROR'):
+                self.assertEqual(self.request(self.learner, '/api/feedback', method='GET').status_code, 503)
+                self.assertEqual(self.request(self.learner, '/api/feedback', {'message': 'not saved'}).status_code, 503)
+        self.assertEqual(self.request(self.learner, '/api/feedback', method='GET').status_code, 200)
 
     def test_app_visit_streak_starts_repeats_advances_and_restarts(self):
         today = backend.today_ist()
