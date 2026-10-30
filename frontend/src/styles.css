@@ -1666,6 +1666,8 @@ input:focus, textarea:focus, select:focus { border-color: #7aa465; box-shadow: 0
 .calendar-hero .primary { color: #173323; background: var(--lime); }
 .calendar-layout { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(280px, .65fr); gap: 16px; align-items: start; }
 .calendar-card { padding: 18px; background: var(--surface); border: 1px solid var(--line); border-radius: 20px; box-shadow: 0 12px 35px rgba(35,52,42,.04); }
+.agenda-card .card-head { margin-bottom: 14px; }
+.agenda-card .empty-state { min-height: 0; justify-content: flex-start; }
 .month-card { grid-row: span 2; }
 .calendar-weekdays { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 5px; margin: 2px 0 7px; }
 .calendar-weekdays span { color: var(--muted); font-size: 9px; font-weight: 900; text-align: center; text-transform: uppercase; }
