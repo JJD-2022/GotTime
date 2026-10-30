@@ -1112,6 +1112,40 @@ def mark_missed_sessions(user_id: int | None = None):
             create_notification(item["learner_id"], "session", f"You missed {item['skill_name']}. One time credit was deducted.")
             create_notification(item["mentor_id"], "session", f"{item['skill_name']} was marked missed. No teaching credit was added.")
 
+        # Joined sessions still need the mentor's completion request within
+        # 24 hours of the scheduled end. Do not penalize an attending learner.
+        cutoff = app_now()
+        cursor.execute(
+            f"""SELECT s.id FROM sessions s
+                LEFT JOIN user_skills us ON us.user_id = s.mentor_id AND us.skill_id = s.skill_id
+                WHERE s.status IN ('accepted', 'scheduled')
+                  AND s.learner_joined_at IS NOT NULL
+                  AND DATE_ADD(DATE_ADD(s.scheduled_for,
+                      INTERVAL COALESCE(us.duration, 60) MINUTE), INTERVAL 24 HOUR) <= %s
+                  {user_filter} ORDER BY s.id""",
+            (cutoff, *params),
+        )
+        # Update only expired primary keys, not a broad range of active sessions;
+        # recheck status and time so a concurrent completion/reschedule wins safely.
+        for item in cursor.fetchall():
+            cursor.execute("""UPDATE sessions s
+                LEFT JOIN user_skills us ON us.user_id = s.mentor_id AND us.skill_id = s.skill_id
+                SET s.status = 'missed'
+                WHERE s.id = %s AND s.status IN ('accepted', 'scheduled')
+                  AND s.learner_joined_at IS NOT NULL
+                  AND DATE_ADD(DATE_ADD(s.scheduled_for,
+                      INTERVAL COALESCE(us.duration, 60) MINUTE), INTERVAL 24 HOUR) <= %s""",
+                (item["id"], cutoff))
+
+
+def refresh_session_expiry(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        # Commit expiry separately: a rejected stale action must not undo it.
+        mark_missed_sessions(session["user_id"])
+        return view(*args, **kwargs)
+    return wrapped
+
 
 _schema_cache = {}
 
@@ -3362,6 +3396,7 @@ def api_book_session():
 
 @app.post("/api/sessions/<int:session_id>/schedule")
 @api_login_required
+@refresh_session_expiry
 @atomic
 def api_schedule_session_time(session_id):
     payload = request.get_json(silent=True) or {}
@@ -3411,6 +3446,7 @@ def api_schedule_session_time(session_id):
 
 @app.post("/api/messages/<int:contact_id>/schedule")
 @api_login_required
+@refresh_session_expiry
 @atomic
 def api_schedule_session_from_chat(contact_id):
     payload = request.get_json(silent=True) or {}
@@ -3492,6 +3528,7 @@ def api_schedule_session_from_chat(contact_id):
 
 @app.post("/api/sessions/<int:session_id>/<action>")
 @api_login_required
+@refresh_session_expiry
 @atomic
 def api_session_action(session_id, action):
     with get_db().cursor() as cursor:
@@ -3595,7 +3632,19 @@ def api_session_action(session_id, action):
             return jsonify({"error": "This session has already changed. Refresh and try again."}), 409
         if action == "complete" and (not item.get("learner_joined_at") or not item.get("mentor_joined_at")):
             return jsonify({"error": "Both learner and mentor must open the meeting link before finishing."}), 400
-        cursor.execute("UPDATE sessions SET status = %s WHERE id = %s", (next_status, session_id))
+        if action == "complete":
+            # Recheck at the write as a request may have crossed the cutoff
+            # while waiting for the participant/session locks.
+            cursor.execute("""UPDATE sessions s
+                LEFT JOIN user_skills us ON us.user_id = s.mentor_id AND us.skill_id = s.skill_id
+                SET s.status = %s WHERE s.id = %s
+                  AND DATE_ADD(DATE_ADD(s.scheduled_for,
+                      INTERVAL COALESCE(us.duration, 60) MINUTE), INTERVAL 24 HOUR) > %s""",
+                (next_status, session_id, app_now()))
+            if cursor.rowcount != 1:
+                return jsonify({"error": "This session has already changed. Refresh and try again."}), 409
+        else:
+            cursor.execute("UPDATE sessions SET status = %s WHERE id = %s", (next_status, session_id))
     if action in {"accept", "schedule"}:
         schedule_session_reminders(item)
     create_notification(item["learner_id"], "session", notice)

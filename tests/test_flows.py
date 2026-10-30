@@ -659,6 +659,71 @@ class Flows(unittest.TestCase):
         self.assertEqual(self.sql('SELECT balance FROM credits WHERE user_id=%s',(self.learner,))[0]['balance'],9)
         self.assertEqual(self.sql('SELECT balance FROM credits WHERE user_id=%s',(self.mentor,))[0]['balance'],10)
 
+    def test_unfinished_joined_session_expires_at_24_hours_after_its_end(self):
+        start = backend.app_now().replace(microsecond=0) - timedelta(days=2)
+        self.sql('UPDATE user_skills SET duration=90 WHERE user_id=%s', (self.mentor,))
+        sid = self.session(joined=True, when=start)
+        cutoff = start + timedelta(minutes=90, hours=24)
+        with patch.object(backend, 'app_now', return_value=cutoff-timedelta(seconds=1)), backend.app.app_context():
+            backend.mark_missed_sessions(self.learner)
+        self.assertEqual(self.sql('SELECT status FROM sessions WHERE id=%s', (sid,))[0]['status'], 'scheduled')
+        with patch.object(backend, 'app_now', return_value=cutoff), backend.app.app_context():
+            backend.mark_missed_sessions(self.learner)
+            backend.mark_missed_sessions(self.mentor)
+        self.assertEqual(self.sql('SELECT status FROM sessions WHERE id=%s', (sid,))[0]['status'], 'missed')
+        self.assertEqual(self.sql('SELECT COUNT(*) n FROM transactions WHERE related_session_id=%s', (sid,))[0]['n'], 0)
+        self.assertEqual([r['balance'] for r in self.sql('SELECT balance FROM credits WHERE user_id IN (%s,%s)', (self.learner,self.mentor))], [10,10])
+
+    def test_late_mark_done_is_rejected_without_opening_app_first(self):
+        sid = self.session('accepted', True, backend.app_now()-timedelta(hours=26))
+        self.assertEqual(self.request(self.mentor, f'/api/sessions/{sid}/complete').status_code, 409)
+        self.assertEqual(self.sql('SELECT status FROM sessions WHERE id=%s', (sid,))[0]['status'], 'missed')
+        self.assertEqual(self.request(self.learner, f'/api/sessions/{sid}/confirm').status_code, 403)
+        self.assertEqual(self.request(self.mentor, f'/api/sessions/{sid}/join').status_code, 400)
+        self.assertEqual(self.request(self.mentor, f'/api/sessions/{sid}/schedule', {'scheduledFor': self.time.isoformat()}).status_code, 400)
+        self.assertEqual(self.sql('SELECT COUNT(*) n FROM transactions WHERE related_session_id=%s', (sid,))[0]['n'], 0)
+
+    def test_mark_done_before_cutoff_can_be_confirmed_after_cutoff(self):
+        now = backend.app_now().replace(microsecond=0)
+        sid = self.session(joined=True, when=now-timedelta(hours=24))
+        with patch.object(backend, 'app_now', return_value=now):
+            self.assertEqual(self.request(self.mentor, f'/api/sessions/{sid}/complete').status_code, 200)
+        with patch.object(backend, 'app_now', return_value=now+timedelta(days=2)):
+            self.assertEqual(self.request(self.learner, f'/api/sessions/{sid}/confirm').status_code, 200)
+        self.assertEqual(self.sql('SELECT status FROM sessions WHERE id=%s', (sid,))[0]['status'], 'completed')
+        self.assertEqual(self.sql('SELECT balance FROM credits WHERE user_id=%s', (self.mentor,))[0]['balance'], 11)
+
+    def test_expiry_preserves_other_states_and_unrelated_accounts(self):
+        old = backend.app_now()-timedelta(days=3)
+        preserved = [(self.session(status, True, old), status) for status in
+                     ['pending', 'awaiting_confirmation', 'completed', 'cancelled']]
+        sid = self.session('accepted', True, old)
+        other = self.user()
+        with backend.app.app_context():
+            backend.mark_missed_sessions(other)
+        self.assertEqual(self.sql('SELECT status FROM sessions WHERE id=%s', (sid,))[0]['status'], 'accepted')
+        payload = self.request(self.mentor, '/api/app', method='GET')
+        self.assertEqual(payload.status_code, 200)
+        self.assertEqual(next(s['status'] for s in payload.json['sessions'] if s['id']==sid), 'missed')
+        for session_id, status in preserved:
+            self.assertEqual(self.sql('SELECT status FROM sessions WHERE id=%s', (session_id,))[0]['status'], status)
+
+    def test_expiry_uses_default_duration_when_saved_skill_was_removed(self):
+        now = backend.app_now().replace(microsecond=0)
+        sid = self.session(joined=True, when=now-timedelta(hours=25))
+        self.sql('DELETE FROM user_skills WHERE user_id=%s', (self.mentor,))
+        with patch.object(backend, 'app_now', return_value=now):
+            self.assertEqual(self.request(self.mentor, f'/api/sessions/{sid}/complete').status_code, 409)
+        self.assertEqual(self.sql('SELECT status FROM sessions WHERE id=%s', (sid,))[0]['status'], 'missed')
+
+    def test_parallel_late_completions_never_award_credit(self):
+        sid = self.session(joined=True, when=backend.app_now()-timedelta(days=2))
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda _: self.request(self.mentor, f'/api/sessions/{sid}/complete').status_code, range(8)))
+        self.assertEqual(results, [409]*8)
+        self.assertEqual(self.sql('SELECT status FROM sessions WHERE id=%s', (sid,))[0]['status'], 'missed')
+        self.assertEqual(self.sql('SELECT COUNT(*) n FROM transactions WHERE related_session_id=%s', (sid,))[0]['n'], 0)
+
     def test_quiz_lifecycle_and_duplicate_submit(self):
         sid=self.session(joined=True)
         route=f'/api/sessions/{sid}/quiz'
