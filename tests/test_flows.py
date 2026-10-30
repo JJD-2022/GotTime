@@ -8,7 +8,7 @@ import hmac
 import json
 import base64
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from unittest.mock import patch, Mock
 import pymysql
 import app as backend
@@ -750,6 +750,75 @@ class Flows(unittest.TestCase):
         self.assertEqual(r.status_code,200,r.json)
         self.assertTrue(any(s['id']==sid for s in r.json['sessions']))
         self.assertEqual(self.request(self.learner,'/api/admin',method='GET').status_code,403)
+
+    def test_underage_members_can_save_and_edit_skills_but_are_not_listed(self):
+        minor = self.user(age=17)
+        self.sql("UPDATE users SET role='mentor',age=99,username='AAA Junior' WHERE id=%s", (minor,))
+        body = {'name': 'Junior drawing', 'category': 'Other', 'description': 'My saved skill',
+                'duration': 60, 'availability': 'online', 'preferred_time': '17:00-21:00'}
+        saved = self.request(minor, '/api/skills', body)
+        self.assertEqual(saved.status_code, 201, saved.json)
+        self.assertIn('turn 18', saved.json['message'])
+        edited = self.request(minor, '/api/skills', {**body, 'id': saved.json['skill']['id'], 'description': 'Updated skill'})
+        self.assertEqual(edited.status_code, 200)
+        own = self.request(minor, '/api/app', method='GET').json
+        self.assertFalse(own['user']['can_mentor'])
+        self.assertEqual(len(own['mySkills']), 1)
+        self.assertEqual(own['mySkills'][0]['description'], 'Updated skill')
+        others = self.request(self.learner, '/api/app', method='GET').json
+        self.assertNotIn(minor, [person['id'] for person in others['mentors']])
+
+    def test_mentor_listing_unlocks_on_eighteenth_birthday_without_skill_changes(self):
+        self.sql("UPDATE users SET birthdate='2008-10-31',age=99,username='AAA Birthday mentor' WHERE id=%s", (self.mentor,))
+        for now, eligible in [(datetime(2026, 10, 30, 23, 59), False), (datetime(2026, 10, 31), True)]:
+            with patch.object(backend, 'app_now', return_value=now):
+                own = self.request(self.mentor, '/api/auth/me', method='GET').json
+                directory = self.request(self.learner, '/api/app', method='GET').json
+                self.assertEqual(own['user']['can_mentor'], eligible)
+                self.assertEqual(self.mentor in [person['id'] for person in directory['mentors']], eligible)
+        self.assertEqual(self.sql('SELECT COUNT(*) n FROM user_skills WHERE user_id=%s', (self.mentor,))[0]['n'], 1)
+
+    def test_ineligible_mentor_cannot_be_booked_even_with_a_stale_card(self):
+        today = backend.app_now().date()
+        dates = [today.replace(year=today.year-17), None, today + timedelta(days=1)]
+        for born in dates:
+            self.sql('UPDATE users SET birthdate=%s,age=99 WHERE id=%s', (born, self.mentor))
+            availability = self.availability()
+            self.assertEqual(availability.status_code, 403, availability.json)
+            result = self.booking()
+            self.assertEqual(result.status_code, 409, result.json)
+            self.assertIn('18 or older', result.json['error'])
+        self.assertEqual(self.sql('SELECT COUNT(*) n FROM sessions WHERE mentor_id=%s', (self.mentor,))[0]['n'], 0)
+        self.assertEqual(self.sql('SELECT balance FROM credits WHERE user_id=%s', (self.learner,))[0]['balance'], 10)
+
+    def test_underage_mentor_cannot_bypass_rule_through_chat_or_session_actions(self):
+        born = backend.app_now().date().replace(year=backend.app_now().year-17)
+        self.sql('UPDATE users SET birthdate=%s WHERE id=%s', (born, self.mentor))
+        body = {'scheduledFor': self.time.isoformat()}
+        chat = self.request(self.mentor, f'/api/messages/{self.learner}/schedule', body)
+        self.assertEqual(chat.status_code, 409, chat.json)
+        sid = self.session('pending')
+        self.assertEqual(self.request(self.mentor, f'/api/sessions/{sid}/accept').status_code, 403)
+        self.assertEqual(self.request(self.mentor, f'/api/sessions/{sid}/schedule', body).status_code, 409)
+        self.sql("UPDATE sessions SET status='accepted' WHERE id=%s", (sid,))
+        self.assertEqual(self.request(self.mentor, f'/api/sessions/{sid}/join', {'guardianConfirmed': True}).status_code, 403)
+        self.assertEqual(self.request(self.learner, f'/api/sessions/{sid}/join').status_code, 403)
+        self.assertEqual(self.sql('SELECT status FROM sessions WHERE id=%s', (sid,))[0]['status'], 'accepted')
+
+    def test_underage_learner_can_still_book_an_adult_mentor(self):
+        learner = self.user(age=17)
+        result = self.booking(learner=learner)
+        self.assertEqual(result.status_code, 201, result.json)
+        self.assertTrue(self.request(self.mentor, '/api/auth/me', method='GET').json['user']['can_mentor'])
+
+    def test_mentor_age_uses_full_birthdate_and_handles_leap_day(self):
+        with patch.object(backend, 'app_now', return_value=datetime(2026, 2, 28)):
+            self.assertFalse(backend.can_be_mentor({'birthdate': '2008-02-29', 'age': 99}))
+            self.assertTrue(backend.can_be_mentor({'birthdate': '2008-02-28'}))
+            self.assertFalse(backend.can_be_mentor({'birthdate': 'bad'}))
+            self.assertFalse(backend.can_be_mentor({'age': 25}))
+        with patch.object(backend, 'app_now', return_value=datetime(2026, 3, 1)):
+            self.assertTrue(backend.can_be_mentor({'birthdate': '2008-02-29'}))
 
     def test_registration_birthdate_profile_skill_and_notifications(self):
         with backend.app.test_client() as client:

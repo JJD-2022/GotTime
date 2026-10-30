@@ -251,10 +251,11 @@ def minimal_app_payload(error: str = ""):
                     JOIN user_skills us ON us.user_id = u.id
                     JOIN skills sk ON sk.id = us.skill_id
                     WHERE u.id != %s AND u.is_active = 1
+                      AND TIMESTAMPDIFF(YEAR, u.birthdate, %s) BETWEEN 18 AND 120
                     GROUP BY us.id, u.id, sk.id
                     ORDER BY rating DESC, sessions_completed DESC, u.username, us.created_at DESC
                     LIMIT 20""",
-                (user_id,),
+                (user_id, today_ist()),
             )
             mentors = cursor.fetchall()
             cursor.execute(
@@ -434,7 +435,7 @@ def app_now():
 
 def lock_participants(cursor, learner_id, mentor_id):
     # All booking paths acquire the same locks, even across different workers.
-    cursor.execute("SELECT id, is_active FROM users WHERE id IN (%s, %s) ORDER BY id FOR UPDATE", (learner_id, mentor_id))
+    cursor.execute("SELECT id, is_active, birthdate FROM users WHERE id IN (%s, %s) ORDER BY id FOR UPDATE", (learner_id, mentor_id))
     return cursor.fetchall()
 
 
@@ -470,6 +471,9 @@ def booking_problem(cursor, learner_id, mentor_id, scheduled_at, duration=60, ex
     accounts = lock_participants(cursor, learner_id, mentor_id)
     if len(accounts) != 2 or not all(row["is_active"] for row in accounts):
         return "Both session participants must have active accounts."
+    mentor = next(row for row in accounts if row["id"] == int(mentor_id))
+    if not can_be_mentor(mentor):
+        return "Mentors must be 18 or older based on their saved birthdate."
     cursor.execute("SELECT balance FROM credits WHERE user_id = %s", (learner_id,))
     balance = (cursor.fetchone() or {}).get("balance", 0)
     cursor.execute("""SELECT COUNT(*) AS n FROM sessions WHERE learner_id = %s
@@ -480,6 +484,11 @@ def booking_problem(cursor, learner_id, mentor_id, scheduled_at, duration=60, ex
     if conflict:
         return overlap_message(conflict, session["user_id"], "mentor" if session["user_id"] == learner_id else "learner")
     return None
+
+
+def can_be_mentor(user):
+    age = age_from_birthdate(str((user or {}).get("birthdate") or ""))
+    return age is not None and age >= 18
 
 
 def guardian_requirement(user, mode):
@@ -1312,7 +1321,8 @@ def daily_quest_progress(user_id, quest, mentor_ids=()):
             cursor.execute(
                 f"""SELECT COUNT(DISTINCT u.id) AS count FROM users u
                     JOIN user_skills us ON us.user_id = u.id
-                    WHERE u.is_active = 1 AND u.id IN ({placeholders})""", tuple(ids),
+                    WHERE u.is_active = 1 AND u.id IN ({placeholders})
+                      AND TIMESTAMPDIFF(YEAR, u.birthdate, %s) BETWEEN 18 AND 120""", (*ids, today_ist()),
             )
         elif quest["kind"] == "book_sessions":
             cursor.execute(
@@ -1889,7 +1899,9 @@ def delete_skill(skill_id):
 def sessions():
     conn = get_db()
     with conn.cursor() as cursor:
-        cursor.execute("SELECT * FROM users WHERE id != %s AND is_active = 1 ORDER BY username", (session["user_id"],))
+        cursor.execute("""SELECT * FROM users WHERE id != %s AND is_active = 1
+                          AND TIMESTAMPDIFF(YEAR, birthdate, %s) BETWEEN 18 AND 120 ORDER BY username""",
+                       (session["user_id"], today_ist()))
         mentors = cursor.fetchall()
         cursor.execute("SELECT * FROM skills ORDER BY name")
         skill_options = cursor.fetchall()
@@ -2172,7 +2184,10 @@ def current_user():
                WHERE u.id = %s AND u.is_active = 1""",
             (session["user_id"],),
         )
-        return cursor.fetchone()
+        person = cursor.fetchone()
+        if person:
+            person["can_mentor"] = can_be_mentor(person)
+        return person
 
 
 def auth_user_payload(row: dict | None):
@@ -2197,6 +2212,7 @@ def auth_user_payload(row: dict | None):
         "birthdate": row.get("birthdate"),
         "needs_birthdate": not bool(row.get("birthdate")),
         "age": age_from_birthdate(str(row.get("birthdate") or "")),
+        "can_mentor": can_be_mentor(row),
         "xp": row.get("xp") or 0,
         "sessions_completed": row.get("sessions_completed") or 0,
         "created_at": row.get("created_at"),
@@ -3191,7 +3207,8 @@ def api_add_skill():
         }
         unlocked_badges = award_badges(session["user_id"])
         reward_badge = "Skill Sharer" if (not had_skills or "Skill Sharer" in unlocked_badges) else None
-        return jsonify({"message": "Skill added to your teaching deck.", "skill": new_skill, "unlockedBadges": unlocked_badges, "rewardBadge": reward_badge}), 201
+        message = "Skill added to your teaching deck." if can_be_mentor(current_user()) else "Skill saved. Your mentor listing will become visible when you turn 18."
+        return jsonify({"message": message, "skill": new_skill, "unlockedBadges": unlocked_badges, "rewardBadge": reward_badge}), 201
     except Exception as exc:
         app.logger.exception("Add skill failed")
         detail = str(exc)
@@ -3265,13 +3282,15 @@ def api_session_availability():
     if mentor_id == session["user_id"]:
         return jsonify({"error": "You cannot book yourself."}), 400
     with get_db().cursor() as cursor:
-        cursor.execute("""SELECT us.duration FROM user_skills us
+        cursor.execute("""SELECT us.duration, u.birthdate FROM user_skills us
             JOIN users u ON u.id = us.user_id AND u.is_active = 1
             WHERE us.user_id = %s AND us.skill_id = %s ORDER BY us.id DESC LIMIT 1""",
             (mentor_id, skill_id))
         skill = cursor.fetchone()
         if not skill:
             return jsonify({"error": "Choose a valid mentor skill."}), 400
+        if not can_be_mentor(skill):
+            return jsonify({"error": "Mentors must be 18 or older based on their saved birthdate."}), 403
         conflict = session_overlap(cursor, session["user_id"], mentor_id, scheduled_at, skill["duration"])
     return jsonify({"available": conflict is None,
                     "message": overlap_message(conflict, session["user_id"]) if conflict else ""})
@@ -3480,7 +3499,10 @@ def api_session_action(session_id, action):
         participants = cursor.fetchone()
         if not participants or session["user_id"] not in {participants["learner_id"], participants["mentor_id"]}:
             return jsonify({"error": "Session not found."}), 404
-        lock_participants(cursor, participants["learner_id"], participants["mentor_id"])
+        accounts = lock_participants(cursor, participants["learner_id"], participants["mentor_id"])
+        mentor = next((row for row in accounts if row["id"] == participants["mentor_id"]), None)
+        if action in {"accept", "schedule", "join"} and not can_be_mentor(mentor):
+            return jsonify({"error": "Mentors must be 18 or older based on their saved birthdate."}), 403
     if action == "join":
         with get_db().cursor() as cursor:
             cursor.execute("SELECT * FROM sessions WHERE id = %s FOR UPDATE", (session_id,))
